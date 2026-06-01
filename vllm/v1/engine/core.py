@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import pickle
 import queue
 import signal
 import threading
@@ -86,6 +87,191 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+class PPSchedulerZmqPublisher:
+    """Publishes SchedulerOutput from pp rank0 EngineCore to pp rank1
+    PassiveEngineCore via ZMQ PUSH/PULL pattern.
+
+    Architecture: caller thread (scheduler loop) only enqueues the raw
+    `SchedulerOutput` object into `_queue`. A dedicated background thread
+    pulls from the queue, pickles, and sends over ZMQ. This keeps the
+    scheduler step path free of pickling cost and mirrors the symmetric
+    queue.Queue bridge used on the subscriber/PassiveScheduler side.
+    """
+
+    SHUTDOWN_TIMEOUT: float = 2.0
+
+    def __init__(self, endpoint: str) -> None:
+        self._endpoint = endpoint
+        self._queue: queue.Queue[
+            tuple[int, SchedulerOutput] | None
+        ] = queue.Queue(maxsize=1000)
+        self._running = True
+        self._seq = 0
+
+        # Set up ZMQ PUSH socket
+        self._ctx = zmq.Context.instance()
+        self._push = self._ctx.socket(zmq.PUSH)
+        self._push.set_hwm(1000)
+        # Bind if wildcard (pp rank0), otherwise connect
+        if "*" in endpoint or "::" in endpoint:
+            self._push.bind(endpoint)
+        else:
+            self._push.connect(endpoint)
+
+        logger.info("PP Scheduler ZMQ publisher started on %s", endpoint)
+
+        # Start background publisher thread
+        self._thread = threading.Thread(
+            target=self._publisher_thread,
+            daemon=True,
+            name="pp-scheduler-zmq-pub",
+        )
+        self._thread.start()
+
+    def publish(self, scheduler_output: SchedulerOutput) -> None:
+        """Queue a SchedulerOutput for publishing. Non-blocking: drops the
+        message if the bridge queue is full (back-pressure protection).
+        """
+        if not self._running:
+            return
+        try:
+            seq = self._seq
+            self._seq += 1
+            self._queue.put_nowait((seq, scheduler_output))
+        except queue.Full:
+            logger.warning(
+                "PP Scheduler ZMQ publish queue full, dropping message"
+            )
+
+    def _publisher_thread(self) -> None:
+        while self._running or self._queue.qsize() > 0:
+            try:
+                item = self._queue.get(timeout=0.1)
+                if item is None:
+                    break
+                seq, scheduler_output = item
+                try:
+                    data = pickle.dumps(
+                        scheduler_output, protocol=pickle.HIGHEST_PROTOCOL
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to serialize SchedulerOutput for ZMQ"
+                    )
+                    continue
+                seq_bytes = seq.to_bytes(8, "big")
+                self._push.send_multipart((seq_bytes, data))
+            except queue.Empty:
+                continue
+            except Exception:
+                logger.exception("Error in PP scheduler ZMQ publisher thread")
+                time.sleep(0.1)
+
+    def shutdown(self) -> None:
+        self._running = False
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
+        try:
+            if self._push is not None:
+                self._push.close(linger=0)
+        except Exception:
+            pass
+
+
+class PPSchedulerZmqSubscriber:
+    """Receives SchedulerOutput from pp rank0 EngineCore on pp rank1
+    via ZMQ PUSH/PULL pattern.
+
+    Runs a background thread that receives SchedulerOutput messages,
+    saves them locally, and logs a summary.
+    """
+
+    SHUTDOWN_TIMEOUT: float = 2.0
+
+    def __init__(self, endpoint: str) -> None:
+        self._endpoint = endpoint
+        self._running = True
+        self._received_outputs: list[tuple[int, SchedulerOutput]] = []
+        self._lock = threading.Lock()
+
+        # Set up ZMQ PULL socket
+        self._ctx = zmq.Context.instance()
+        self._pull = self._ctx.socket(zmq.PULL)
+        self._pull.set_hwm(1000)
+        self._pull.connect(endpoint)
+
+        logger.info("PP Scheduler ZMQ subscriber connecting to %s", endpoint)
+
+        # Start background subscriber thread
+        self._thread = threading.Thread(
+            target=self._subscriber_thread,
+            daemon=True,
+            name="pp-scheduler-zmq-sub",
+        )
+        self._thread.start()
+
+    def _subscriber_thread(self) -> None:
+        while self._running:
+            try:
+                if not self._pull.poll(timeout=100):
+                    continue
+                seq_bytes, data = self._pull.recv_multipart()
+                seq = int.from_bytes(seq_bytes, "big")
+                scheduler_output = pickle.loads(data)
+                with self._lock:
+                    self._received_outputs.append((seq, scheduler_output))
+                logger.info(
+                    "PP rank1 received SchedulerOutput seq=%d, "
+                    "total_scheduled_tokens=%d, "
+                    "new_reqs=%d, cached_reqs=%d, "
+                    "finished_req_ids=%s",
+                    seq,
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.scheduled_new_reqs),
+                    scheduler_output.scheduled_cached_reqs.num_reqs,
+                    scheduler_output.finished_req_ids,
+                )
+            except zmq.ZMQError:
+                if self._running:
+                    logger.exception("ZMQ error in PP scheduler subscriber")
+            except Exception:
+                if self._running:
+                    logger.exception("Error in PP scheduler ZMQ subscriber thread")
+
+    def get_latest_output(self) -> SchedulerOutput | None:
+        """Return the most recently received SchedulerOutput, or None."""
+        with self._lock:
+            if self._received_outputs:
+                return self._received_outputs[-1][1]
+        return None
+
+    def get_all_outputs(self) -> list[tuple[int, SchedulerOutput]]:
+        """Return all received (seq, SchedulerOutput) pairs."""
+        with self._lock:
+            return list(self._received_outputs)
+
+    def consume_new_outputs(self) -> list[tuple[int, SchedulerOutput]]:
+        """Return and clear all new (seq, SchedulerOutput) pairs since last call."""
+        with self._lock:
+            outputs = self._received_outputs
+            self._received_outputs = []
+            return outputs
+
+    def shutdown(self) -> None:
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
+        try:
+            if self._pull is not None:
+                self._pull.close(linger=0)
+        except Exception:
+            pass
 
 
 class EngineCore:
@@ -227,6 +413,14 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+        # Set up PP scheduler ZMQ publisher if configured.
+        # This publishes SchedulerOutput to pp rank1's PassiveEngineCore.
+        self._pp_scheduler_zmq_publisher: PPSchedulerZmqPublisher | None = None
+        if envs.VLLM_PP_SCHEDULER_ZMQ_ADDR is not None:
+            self._pp_scheduler_zmq_publisher = PPSchedulerZmqPublisher(
+                envs.VLLM_PP_SCHEDULER_ZMQ_ADDR
+            )
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -443,6 +637,11 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        # Publish SchedulerOutput to pp rank1 if ZMQ is configured.
+        if self._pp_scheduler_zmq_publisher is not None:
+            self._pp_scheduler_zmq_publisher.publish(scheduler_output)
+
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -501,6 +700,11 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+
+            # Publish SchedulerOutput to pp rank1 if ZMQ is configured.
+            if self._pp_scheduler_zmq_publisher is not None:
+                self._pp_scheduler_zmq_publisher.publish(scheduler_output)
+
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -602,6 +806,9 @@ class EngineCore:
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
+        if self._pp_scheduler_zmq_publisher is not None:
+            self._pp_scheduler_zmq_publisher.shutdown()
+            self._pp_scheduler_zmq_publisher = None
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
@@ -1128,6 +1335,28 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
+
+            # Set up PP scheduler ZMQ publisher address for pp rank0.
+            # When pipeline_parallel_size > 1 and nnodes_within_dp > 1,
+            # the leader PP rank publishes SchedulerOutput to non-leader
+            # PP ranks via ZMQ.
+            if (
+                parallel_config.pipeline_parallel_size > 1
+                and parallel_config.nnodes_within_dp > 1
+                and envs.VLLM_PP_SCHEDULER_ZMQ_ADDR is None
+            ):
+                pp_zmq_port = int(
+                    os.getenv("VLLM_PP_SCHEDULER_ZMQ_PORT", "5558")
+                )
+                os.environ["VLLM_PP_SCHEDULER_ZMQ_ADDR"] = (
+                    f"tcp://*:{pp_zmq_port}"
+                )
+                envs.disable_envs_cache()
+                logger.info(
+                    "PP scheduler ZMQ publisher address: %s",
+                    os.environ["VLLM_PP_SCHEDULER_ZMQ_ADDR"],
+                )
+
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
@@ -2189,3 +2418,179 @@ class EngineCoreActor(EngineCoreActorMixin, EngineCoreProc):
             log_stats,
             engine_index=dp_rank,
         )
+
+
+class PassiveEngineCoreProc:
+    """Passive EngineCore process for non-leader PP ranks.
+
+    Mirrors the `EngineCore` / `EngineCoreProc` shape on rank0:
+
+    - `step()` is the single-tick action: poll the ZMQ inbox, ask the
+      `PassiveScheduler` for one batch, fan its slice plan out to the
+      worker `rpc_broadcast_mq`.
+    - `run_busy_loop()` is the long-running driver that keeps calling
+      `step()` until the executor reports failure.
+
+    Unlike rank0, there is no local scheduling decision ¡ª every batch
+    comes pre-decided over ZMQ from the leader rank. The static
+    :py:meth:`run_passive_engine_core` is the process entry point that
+    constructs the executor + subscriber, builds an instance, and hands
+    off to `run_busy_loop`.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        executor,  # MultiprocExecutor ¡ª duck-typed to avoid heavy import
+        pp_subscriber: "PPSchedulerZmqSubscriber",
+        dispatch_policy: "DispatchPolicy | None" = None,
+    ) -> None:
+        from vllm.v1.core.sched.passive_scheduler import (
+            DispatchPolicy,
+            PassiveScheduler,
+        )
+        if dispatch_policy is None:
+            dispatch_policy = DispatchPolicy.PREFILL_FIRST
+        self.vllm_config = vllm_config
+        self.executor = executor
+        self.passive_scheduler = PassiveScheduler(
+            vllm_config, pp_subscriber, dispatch_policy=dispatch_policy
+        )
+        self._idle_sleep_seconds = 0.001
+
+    def step(self) -> bool:
+        """Single tick: poll ZMQ ¡ú pick batches ¡ú enqueue worker payloads.
+
+        Drains EMPTY batches in one go (cheap sync messages) and takes
+        at most one batch from each non-empty phase queue per call, in
+        the order encoded by the configured dispatch policy.
+
+        Returns:
+            True if at least one payload was enqueued, False if the
+            scheduler had nothing to dispatch.
+        """
+        from vllm.v1.core.sched.output import BatchType
+
+        self.passive_scheduler.poll_and_classify()
+        dispatched = False
+        while True:
+            batch = self.passive_scheduler.schedule()
+            if batch.is_empty():
+                break
+            for slice_info in batch.slices:
+                payload = (
+                    (batch.scheduler_output, slice_info)
+                    if slice_info is not None
+                    else (batch.scheduler_output,)
+                )
+                self.executor.rpc_broadcast_mq.enqueue(
+                    (b"pp_scheduler_output", payload, {}, None)
+                )
+            dispatched = True
+            # EMPTY can arrive in bursts; keep draining. All other phases
+            # are throttled to one batch per step, matching the previous
+            # `PassiveScheduler.step()` behavior.
+            if batch.scheduler_output.batch_type != BatchType.EMPTY:
+                break
+        return dispatched
+
+    def run_busy_loop(self) -> None:
+        """Drive `step()` until the executor reports failure or shutdown."""
+        try:
+            while not self.executor.is_failed:
+                if not self.step():
+                    time.sleep(self._idle_sleep_seconds)
+        finally:
+            self.passive_scheduler.shutdown()
+
+    @staticmethod
+    def run_passive_engine_core(
+        vllm_config: VllmConfig,
+        ready_pipe,  # multiprocessing.Connection for signaling readiness
+    ):
+        """Entry point for the passive EngineCore process.
+
+        Creates a MultiprocExecutor to spawn workers, optionally wires up
+        a ZMQ subscriber to receive SchedulerOutputs from the leader PP
+        rank, then hands off to `PassiveEngineCoreProc.run_busy_loop`.
+        """
+        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+        maybe_register_config_serialize_by_value()
+
+        # Mark this process as a non-leader PP rank running with passive
+        # EngineCore, so that MultiprocExecutor and WorkerProc set up dual
+        # message queues (local + cross-node).
+        os.environ["VLLM_PP_NON_LEADER_ENGINE_CORE"] = "1"
+        envs.disable_envs_cache()
+
+        set_process_title("PassiveEngineCore")
+        maybe_init_worker_tracer(
+            "vllm.engine_core", "engine_core", "PassiveEngineCore"
+        )
+        decorate_logs()
+
+        pp_subscriber: PPSchedulerZmqSubscriber | None = None
+        if envs.VLLM_PP_SCHEDULER_ZMQ_ADDR is not None:
+            pp_subscriber = PPSchedulerZmqSubscriber(
+                envs.VLLM_PP_SCHEDULER_ZMQ_ADDR
+            )
+
+        shutdown_requested = False
+
+        def signal_handler(signum, frame):
+            nonlocal shutdown_requested
+            if not shutdown_requested:
+                shutdown_requested = True
+                raise SystemExit
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        executor = None
+        try:
+            executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+
+            ready_pipe.send({"status": "READY"})
+            ready_pipe.close()
+            ready_pipe = None
+
+            if pp_subscriber is not None:
+                executor.start_worker_monitor(inline=False)
+
+                from vllm.v1.core.sched.passive_scheduler import DispatchPolicy
+                try:
+                    policy = DispatchPolicy(envs.VLLM_PP_PASSIVE_DISPATCH_POLICY)
+                except ValueError:
+                    logger.warning(
+                        "Unknown VLLM_PP_PASSIVE_DISPATCH_POLICY=%r; "
+                        "falling back to prefill_first.",
+                        envs.VLLM_PP_PASSIVE_DISPATCH_POLICY,
+                    )
+                    policy = DispatchPolicy.PREFILL_FIRST
+
+                proc = PassiveEngineCoreProc(
+                    vllm_config, executor, pp_subscriber,
+                    dispatch_policy=policy,
+                )
+                proc.run_busy_loop()
+            else:
+                # No ZMQ subscriber, just monitor workers inline.
+                executor.start_worker_monitor(inline=True)
+
+        except SystemExit:
+            logger.debug("PassiveEngineCore exiting.")
+        except Exception:
+            logger.exception("PassiveEngineCore encountered a fatal error.")
+            raise
+        finally:
+            if ready_pipe is not None:
+                try:
+                    ready_pipe.send({"status": "FAILED"})
+                except Exception:
+                    pass
+                ready_pipe.close()
+            if pp_subscriber is not None:
+                pp_subscriber.shutdown()
+            if executor is not None:
+                executor.shutdown()

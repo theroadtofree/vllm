@@ -66,6 +66,11 @@ from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.version import __version__ as VLLM_VERSION
 
+import debugpy
+debugpy.listen(("0.0.0.0", 8008))
+print("Debugpy is listening on port 8008, wait_for_client")
+debugpy.wait_for_client()
+
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)

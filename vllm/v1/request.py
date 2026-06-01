@@ -160,6 +160,10 @@ class Request:
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
+        # Chunk prefill tracking: starts at 1 and increments after each
+        # prefill chunk is executed.
+        self.chunk_num = 1
+
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
@@ -274,6 +278,14 @@ class Request:
 
     def get_finished_reason(self) -> FinishReason | None:
         return RequestStatus.get_finished_reason(self.status)
+
+    def is_last_prefill_chunk(self, num_scheduled_tokens: int) -> bool:
+        """Return True if the given number of scheduled tokens would
+        complete the prefill phase for this request."""
+        return (
+            self.num_computed_tokens + num_scheduled_tokens
+            >= self.num_tokens + self.num_output_placeholders
+        )
 
     def get_num_encoder_embeds(self, input_id: int) -> int:
         assert input_id < len(self.mm_features)

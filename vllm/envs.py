@@ -47,6 +47,10 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_NON_LEADER_ENGINE_CORE: bool = False
+    VLLM_PP_SCHEDULER_ZMQ_ADDR: str | None = None
+    VLLM_LAYER_SLICE_SIZE: int = 0
+    VLLM_PP_PASSIVE_DISPATCH_POLICY: str = "prefill_first"
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -740,6 +744,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Whether this is a non-leader PP rank running with a passive EngineCore.
+    # Set by PassiveEngineCoreProc before creating the MultiprocExecutor.
+    "VLLM_PP_NON_LEADER_ENGINE_CORE": lambda: bool(
+        int(os.getenv("VLLM_PP_NON_LEADER_ENGINE_CORE", "0"))
+    ),
+    # ZMQ address for PP scheduler output communication between enginecores.
+    # pp rank0 (PUB) binds to this address, pp rank1 (SUB) connects to it.
+    # Format: "tcp://host:port" (e.g. "tcp://*:5558" for binding,
+    # "tcp://192.168.1.1:5558" for connecting).
+    "VLLM_PP_SCHEDULER_ZMQ_ADDR": lambda: os.getenv(
+        "VLLM_PP_SCHEDULER_ZMQ_ADDR", None
+    ),
+    # Layer slice size for non-leader PP ranks. When > 0, the local layer
+    # range of a SchedulerOutput is sliced into groups of this size and each
+    # slice is executed as a separate forward pass (with a CUDA sync between
+    # slices). This enables layerwise-disaggregated execution similar to
+    # MindIE's LayerwiseCloudPrefillGraphWrapper. Only effective when PP > 1.
+    "VLLM_LAYER_SLICE_SIZE": lambda: int(
+        os.getenv("VLLM_LAYER_SLICE_SIZE", "0")
+    ),
+    # Dispatch policy for the non-leader PP rank's PassiveScheduler.
+    # One of: "prefill_first" (default), "decode_first", "pdmix_first".
+    # Controls the order in which PURE_PREFILL / PD_MIX / PURE_DECODE
+    # SchedulerOutputs are popped from their ready queues per step. EMPTY
+    # batches are always drained first regardless of policy.
+    "VLLM_PP_PASSIVE_DISPATCH_POLICY": lambda: os.getenv(
+        "VLLM_PP_PASSIVE_DISPATCH_POLICY", "prefill_first"
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
