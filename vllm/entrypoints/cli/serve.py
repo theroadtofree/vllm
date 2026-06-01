@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import os
 import signal
 import time
 
@@ -24,7 +25,6 @@ from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
 from vllm.v1.executor import Executor
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 from vllm.v1.utils import APIServerProcessManager, wait_for_completion_or_failure
 
@@ -181,20 +181,89 @@ def run_headless(args: argparse.Namespace):
     signal.signal(signal.SIGINT, signal_handler)
 
     if parallel_config.node_rank_within_dp > 0:
+        from vllm.utils.system_utils import get_mp_context
+        from vllm.v1.engine.core import PassiveEngineCoreProc
         from vllm.version import __version__ as VLLM_VERSION
 
-        # Run headless workers (for multi-node PP/TP).
+        # Launch a passive EngineCore process for non-leader PP rank.
+        # The enginecore creates workers and monitors them, while workers
+        # receive scheduler_output via inner_dp_world_group from the leader.
         host = parallel_config.master_addr
         head_node_address = f"{host}:{parallel_config.master_port}"
+
+        # Set up PP scheduler ZMQ address for pp rank1 to subscribe
+        # to SchedulerOutput from pp rank0's EngineCore.
+        if envs.VLLM_PP_SCHEDULER_ZMQ_ADDR is None:
+            # Default: connect to pp rank0's master addr on port 5558
+            pp_zmq_port = int(
+                os.getenv("VLLM_PP_SCHEDULER_ZMQ_PORT", "5558")
+            )
+            os.environ["VLLM_PP_SCHEDULER_ZMQ_ADDR"] = (
+                f"tcp://{host}:{pp_zmq_port}"
+            )
+            envs.disable_envs_cache()
+            logger.info(
+                "PP scheduler ZMQ subscriber address: %s",
+                os.environ["VLLM_PP_SCHEDULER_ZMQ_ADDR"],
+            )
+
         logger.info(
-            "Launching vLLM (v%s) headless multiproc executor, "
+            "Launching vLLM (v%s) headless passive EngineCore, "
             "with head node address %s for torch.distributed process group.",
             VLLM_VERSION,
             head_node_address,
         )
 
-        executor = MultiprocExecutor(vllm_config, monitor_workers=False)
-        executor.start_worker_monitor(inline=True)
+        context = get_mp_context()
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+
+        proc = context.Process(
+            target=PassiveEngineCoreProc.run_passive_engine_core,
+            kwargs={
+                "vllm_config": vllm_config,
+                "ready_pipe": ready_writer,
+            },
+            name="PassiveEngineCore",
+        )
+        proc.start()
+        ready_writer.close()
+
+        # Wait for passive enginecore to signal readiness
+        try:
+            response = ready_reader.recv()
+            if response.get("status") != "READY":
+                raise RuntimeError(
+                    "PassiveEngineCore failed to start. "
+                    f"Response: {response}"
+                )
+        except EOFError:
+            raise RuntimeError(
+                "PassiveEngineCore process died during startup. "
+                "Check logs for details."
+            )
+        finally:
+            ready_reader.close()
+
+        logger.info("PassiveEngineCore is ready.")
+
+        try:
+            proc.join()
+            if proc.exitcode and proc.exitcode != 0:
+                logger.error(
+                    "PassiveEngineCore exited with code %d", proc.exitcode
+                )
+        finally:
+            timeout = None
+            if shutdown_requested:
+                timeout = vllm_config.shutdown_timeout
+                logger.info(
+                    "Waiting up to %d seconds for PassiveEngineCore to exit",
+                    timeout,
+                )
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=timeout)
+            logger.info("Shutting down.")
         return
 
     host = parallel_config.data_parallel_master_ip

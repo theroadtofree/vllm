@@ -318,9 +318,18 @@ class Qwen3ForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        layer_slice_start: int | None = None,
+        layer_slice_end: int | None = None,
+        layer_slice_return_intermediate: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            layer_slice_start=layer_slice_start,
+            layer_slice_end=layer_slice_end,
+            layer_slice_return_intermediate=layer_slice_return_intermediate,
         )
         return hidden_states
 

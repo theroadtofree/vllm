@@ -518,6 +518,9 @@ class EngineArgs:
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
+    enable_pd_separation: bool = SchedulerConfig.enable_pd_separation
+    pd_scheduling_policy: str = SchedulerConfig.pd_scheduling_policy
+
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
     )
@@ -1224,6 +1227,12 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--enable-pd-separation", **scheduler_kwargs["enable_pd_separation"]
+        )
+        scheduler_group.add_argument(
+            "--pd-scheduling-policy", **scheduler_kwargs["pd_scheduling_policy"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1791,6 +1800,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            enable_pd_separation=self.enable_pd_separation,
+            pd_scheduling_policy=self.pd_scheduling_policy,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

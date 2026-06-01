@@ -127,7 +127,9 @@ class WorkerBase:
         raise NotImplementedError
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """If this method returns None, sample_tokens should be called immediately after
         to obtain the ModelRunnerOutput.
@@ -325,11 +327,16 @@ class WorkerWrapperBase:
             )
 
     def execute_model(
-        self, scheduler_output: SchedulerOutput
+        self,
+        scheduler_output: SchedulerOutput,
+        layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         self._apply_mm_cache(scheduler_output)
 
-        return self.worker.execute_model(scheduler_output)
+        return self.worker.execute_model(
+            scheduler_output,
+            layer_slice_info=layer_slice_info,
+        )
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

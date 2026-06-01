@@ -760,7 +760,9 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def execute_model(
-        self, scheduler_output: "SchedulerOutput"
+        self,
+        scheduler_output: "SchedulerOutput",
+        layer_slice_info: Any = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -25,6 +26,26 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+
+
+class BatchType(enum.Enum):
+    """Composition of a single SchedulerOutput batch.
+
+    Tagged by the producing scheduler so that the non-leader PP rank's
+    PassiveScheduler can route the batch without re-inspecting per-request
+    state.
+
+    - PD_MIX:       prefill and decode requests in the same batch (default
+                    for the legacy mixed scheduler)
+    - PURE_PREFILL: every scheduled request is in its prefill phase
+    - PURE_DECODE:  every scheduled request is in its decode phase
+    - EMPTY:        no tokens scheduled this step (sync-only batch, e.g.
+                    propagating finished_req_ids)
+    """
+    PD_MIX = "pd_mix"
+    PURE_PREFILL = "pure_prefill"
+    PURE_DECODE = "pure_decode"
+    EMPTY = "empty"
 
 
 @dataclass
@@ -237,6 +258,13 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Composition of the scheduled batch. Producers (schedulers) tag this
+    # field so downstream consumers ¡ª notably the non-leader PP rank's
+    # PassiveScheduler ¡ª can route the batch without re-inspecting per-request
+    # state. The base PD-mix Scheduler leaves it at the default (PD_MIX);
+    # PDSeparatedScheduler overrides it to PURE_PREFILL / PURE_DECODE / EMPTY.
+    batch_type: BatchType = BatchType.PD_MIX
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
