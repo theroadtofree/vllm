@@ -2431,7 +2431,7 @@ class PassiveEngineCoreProc:
     - `run_busy_loop()` is the long-running driver that keeps calling
       `step()` until the executor reports failure.
 
-    Unlike rank0, there is no local scheduling decision ¡ª every batch
+    Unlike rank0, there is no local scheduling decision â€” every batch
     comes pre-decided over ZMQ from the leader rank. The static
     :py:meth:`run_passive_engine_core` is the process entry point that
     constructs the executor + subscriber, builds an instance, and hands
@@ -2441,7 +2441,7 @@ class PassiveEngineCoreProc:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor,  # MultiprocExecutor ¡ª duck-typed to avoid heavy import
+        executor,  # MultiprocExecutor ï¿½ï¿½ duck-typed to avoid heavy import
         pp_subscriber: "PPSchedulerZmqSubscriber",
         dispatch_policy: "DispatchPolicy | None" = None,
     ) -> None:
@@ -2459,7 +2459,7 @@ class PassiveEngineCoreProc:
         self._idle_sleep_seconds = 0.001
 
     def step(self) -> bool:
-        """Single tick: poll ZMQ ¡ú pick batches ¡ú enqueue worker payloads.
+        """Single tick: poll ZMQ ï¿½ï¿½ pick batches ï¿½ï¿½ enqueue worker payloads.
 
         Drains EMPTY batches in one go (cheap sync messages) and takes
         at most one batch from each non-empty phase queue per call, in
