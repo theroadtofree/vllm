@@ -501,10 +501,16 @@ class Qwen3_5ForCausalLMBase(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        layer_slice_start: int | None = None,
+        layer_slice_end: int | None = None,
+        layer_slice_return_intermediate: bool = False,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds,
+            layer_slice_start=layer_slice_start,
+            layer_slice_end=layer_slice_end,
+            layer_slice_return_intermediate=layer_slice_return_intermediate,
         )
 
         return hidden_states
@@ -626,6 +632,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        layer_slice_start: int | None = None,
+        layer_slice_end: int | None = None,
+        layer_slice_return_intermediate: bool = False,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         """Run forward pass for Qwen3.5.
@@ -641,6 +650,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             intermediate_tensors: Intermediate tensors from previous pipeline
                 stages.
             inputs_embeds: Pre-computed input embeddings.
+            layer_slice_start: Start index (0-based, within local PP rank) for
+                layer-sliced execution.  None means use the default start layer.
+            layer_slice_end: End index (0-based, within local PP rank) for
+                layer-sliced execution.  None means use the default end layer.
+            layer_slice_return_intermediate: If True, return IntermediateTensors
+                even on the last PP rank (needed for layer slicing).
             **kwargs: Additional keyword arguments including:
                 - pixel_values: Pixel values to be fed to a model.
                     `None` if no images are passed.
@@ -660,6 +675,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            layer_slice_start=layer_slice_start,
+            layer_slice_end=layer_slice_end,
+            layer_slice_return_intermediate=layer_slice_return_intermediate,
         )
 
         return hidden_states

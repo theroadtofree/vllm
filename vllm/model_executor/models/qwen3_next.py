@@ -506,6 +506,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        layer_slice_start: int | None = None,
+        layer_slice_end: int | None = None,
+        layer_slice_return_intermediate: bool = False,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -518,10 +521,25 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        # Determine the layer range to execute.  When layer slicing is
+        # active, layer_slice_start/end (0-based within the local PP
+        # rank's layers) restrict the iteration; otherwise the full
+        # [start_layer, end_layer) range is used.
+        exec_start = (
+            self.start_layer + layer_slice_start
+            if layer_slice_start is not None
+            else self.start_layer
+        )
+        exec_end = (
+            self.start_layer + layer_slice_end
+            if layer_slice_end is not None
+            else self.end_layer
+        )
+
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
+            islice(self.layers, exec_start, exec_end),
+            start=exec_start,
         ):
             hidden_states, residual = layer(
                 positions=positions,
@@ -532,7 +550,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
+        if not get_pp_group().is_last_rank or layer_slice_return_intermediate:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -766,10 +784,16 @@ class Qwen3NextForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        layer_slice_start: int | None = None,
+        layer_slice_end: int | None = None,
+        layer_slice_return_intermediate: bool = False,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds,
+            layer_slice_start=layer_slice_start,
+            layer_slice_end=layer_slice_end,
+            layer_slice_return_intermediate=layer_slice_return_intermediate,
         )
 
         return hidden_states
