@@ -594,12 +594,9 @@ class EngineArgs:
     enable_chunked_prefill: bool | None = None
     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
 
-<<<<<<< HEAD
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
-=======
     enable_pd_separation: bool = SchedulerConfig.enable_pd_separation
     pd_scheduling_policy: str = SchedulerConfig.pd_scheduling_policy
->>>>>>> 3fc7e2210 (layerwise_pd_hiding)
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager

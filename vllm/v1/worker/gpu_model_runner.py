@@ -4538,21 +4538,12 @@ class GPUModelRunner(
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-<<<<<<< HEAD
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
-=======
-        #torch.distributed.broadcast(
-        #    sampled_token_ids, src=pp.rank, group=pp.device_group
-        #)
-        for rank in pp.ranks:
-            if rank != pp.rank:
-                torch.distributed.send(sampled_token_ids, dst=rank, group=pp.device_group)
->>>>>>> 3fc7e2210 (layerwise_pd_hiding)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -4561,14 +4552,9 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-<<<<<<< HEAD
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-=======
-        #torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        torch.distributed.recv(recv, src=pp.last_rank, group=pp.device_group)
->>>>>>> 3fc7e2210 (layerwise_pd_hiding)
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
