@@ -179,6 +179,37 @@ class Qwen3_5MoeConfig(PretrainedConfig):
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    # Delegate text-model attributes to text_config so that code accessing
+    # these on the top-level multimodal config (e.g. via hf_config) works
+    # correctly instead of raising AttributeError.
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.text_config.num_hidden_layers
+
+    @property
+    def num_attention_heads(self) -> int:
+        return self.text_config.num_attention_heads
+
+    @property
+    def num_key_value_heads(self) -> int:
+        return self.text_config.num_key_value_heads
+
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
+
+    @property
+    def vocab_size(self) -> int:
+        return self.text_config.vocab_size
+
+    @property
+    def layer_types(self):
+        return self.text_config.layer_types
+
+    @property
+    def num_experts(self) -> int:
+        return self.text_config.num_experts
+
     def __init__(
         self,
         text_config=None,
