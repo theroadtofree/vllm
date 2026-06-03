@@ -240,5 +240,26 @@ class SchedulerInterface(ABC):
         """Shutdown the scheduler."""
         raise NotImplementedError
 
+    @abstractmethod
+    def push_batch_last(self, scheduler_output: "SchedulerOutput") -> None:
+        """Push a SchedulerOutput whose first-stage (head) execution has
+        completed into the batch_last[] queue, awaiting last-stage (tail)
+        scheduling.
+
+        Called by EngineCore after batch_first execution finishes.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_batch_last_depth(self) -> int:
+        """Return the current depth of the batch_last[] queue."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_head_done_requests(self) -> bool:
+        """Return True if there are requests in batch_last[] awaiting
+        last-stage (tail) scheduling."""
+        raise NotImplementedError
+
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
         return None

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -177,6 +178,32 @@ class CachedRequestData:
         )
 
 
+class BatchType(enum.Enum):
+    """Edge-cloud asynchronous scheduling batch type."""
+
+    FULL = "full"  # Standard mode: head + tail in the same step
+    FIRST = "first"  # Only execute head layers
+    LAST = "last"  # Only execute tail layers
+    EMPTY = "empty"  # No schedulable work
+
+
+@dataclass
+class FirstStageContext:
+    """Context passed from first-stage (head) execution to last-stage (tail)
+    execution in edge-cloud async scheduling.
+
+    Phase 1: basic structure with scheduler output snapshot.
+    Phase 2/3: will be extended with hidden state metadata, KV cache
+    snapshots, and dual-channel transfer descriptors.
+    """
+
+    # Snapshot of the original scheduler output for tail reconstruction
+    orig_scheduler_output: "SchedulerOutput"
+
+    # Timestamp when this batch entered batch_last[]
+    enqueue_timestamp: float = 0.0
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -240,6 +267,13 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # ── Edge-cloud async scheduling fields ──
+    batch_type: BatchType = BatchType.FULL
+
+    # Context from first-stage execution, passed to last-stage execution.
+    # Only non-None when batch_type == LAST.
+    first_stage_context: FirstStageContext | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -252,6 +286,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            batch_type=BatchType.EMPTY,
         )
 
 

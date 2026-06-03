@@ -482,6 +482,8 @@ class EngineArgs:
     enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
     edge_npu_count: int = ParallelConfig.edge_npu_count
     cloud_npu_count: int = ParallelConfig.cloud_npu_count
+    enable_edge_cloud_async_sched: bool = ParallelConfig.enable_edge_cloud_async_sched
+    max_batch_last_depth: int = ParallelConfig.max_batch_last_depth
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1056,6 +1058,14 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--cloud-npu-count", **parallel_kwargs["cloud_npu_count"]
+        )
+        parallel_group.add_argument(
+            "--enable-edge-cloud-async-sched",
+            **parallel_kwargs["enable_edge_cloud_async_sched"],
+        )
+        parallel_group.add_argument(
+            "--max-batch-last-depth",
+            **parallel_kwargs["max_batch_last_depth"],
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -1933,6 +1943,8 @@ class EngineArgs:
             enable_edge_cloud=self.enable_edge_cloud,
             edge_npu_count=self.edge_npu_count,
             cloud_npu_count=self.cloud_npu_count,
+            enable_edge_cloud_async_sched=self.enable_edge_cloud_async_sched,
+            max_batch_last_depth=self.max_batch_last_depth,
             is_edge_node=not headless if self.enable_edge_cloud else False,
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,

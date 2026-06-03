@@ -37,7 +37,9 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
+    BatchType,
     CachedRequestData,
+    FirstStageContext,
     GrammarOutput,
     NewRequestData,
     SchedulerOutput,
@@ -276,6 +278,20 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+        # ── Edge-cloud async scheduling (Phase 1+) ──
+        self.batch_last: deque[SchedulerOutput] = deque()
+        self.max_batch_last_depth = (
+            vllm_config.parallel_config.max_batch_last_depth
+            if hasattr(vllm_config.parallel_config, "max_batch_last_depth")
+            else 2
+        )
+        self.enable_edge_cloud_async_sched = (
+            vllm_config.parallel_config.enable_edge_cloud
+            and getattr(
+                vllm_config.parallel_config, "enable_edge_cloud_async_sched", False
+            )
+        )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -327,6 +343,51 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
+        """Schedule requests with edge-cloud async head/tail decoupling.
+
+        When enable_edge_cloud_async_sched is True, this method implements
+        a three-level priority strategy:
+          1. batch_first  - schedule new requests as FIRST (head only)
+          2. batch_last   - schedule requests from batch_last[] as LAST (tail only)
+          3. EMPTY        - nothing to schedule
+        """
+        if not self.enable_edge_cloud_async_sched:
+            return self._schedule_standard(batch_type=BatchType.FULL)
+
+        # Priority 1: batch_first
+        if (
+            len(self.batch_last) < self.max_batch_last_depth
+            and (self.waiting or self.running)
+            and self._pause_state == PauseState.UNPAUSED
+        ):
+            scheduler_output = self._schedule_standard()
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                scheduler_output.batch_type = BatchType.FIRST
+                logger.debug(
+                    "[EdgeCloudSched] Dispatch batch_first, "
+                    "batch_last_depth=%d/%d",
+                    len(self.batch_last), self.max_batch_last_depth,
+                )
+                return scheduler_output
+            # Fall through to batch_last or EMPTY if standard schedule returns empty
+
+        # Priority 2: batch_last
+        if self.batch_last:
+            scheduler_output = self.batch_last.popleft()
+            scheduler_output.batch_type = BatchType.LAST
+            logger.debug(
+                "[EdgeCloudSched] Dispatch batch_last, "
+                "remaining_batch_last=%d", len(self.batch_last),
+            )
+            return scheduler_output
+
+        # Priority 3: EMPTY
+        logger.debug("[EdgeCloudSched] Dispatch EMPTY")
+        return SchedulerOutput.make_empty()
+
+    def _schedule_standard(
+        self, batch_type: BatchType = BatchType.FULL
+    ) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -919,6 +980,7 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        scheduler_output.batch_type = batch_type
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1359,6 +1421,19 @@ class Scheduler(SchedulerInterface):
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
                 continue
+
+            # ── Edge-cloud async: batch_first skips sampling/output ──
+            if scheduler_output.batch_type == BatchType.FIRST:
+                # Head execution: do not sample, do not check stop,
+                # do not generate EngineCoreOutput.
+                # KV cache and computed tokens are already updated during
+                # model execution.
+                continue
+
+            # ── Edge-cloud async: batch_last restores HEAD_DONE to RUNNING ──
+            if scheduler_output.batch_type == BatchType.LAST:
+                if request.status == RequestStatus.HEAD_DONE:
+                    request.status = RequestStatus.RUNNING
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -1824,6 +1899,20 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
 
+        # ── Edge-cloud async: clean up batch_last[] ──
+        if self.enable_edge_cloud_async_sched and self.batch_last:
+            aborted_in_batch_last: list[SchedulerOutput] = []
+            for so in self.batch_last:
+                so_req_ids = set(so.num_scheduled_tokens.keys())
+                if so_req_ids & request_ids:
+                    aborted_in_batch_last.append(so)
+            for so in aborted_in_batch_last:
+                self.batch_last.remove(so)
+                for req_id in so.num_scheduled_tokens:
+                    if req_id in self.requests:
+                        self.kv_cache_manager.free(self.requests[req_id])
+                        del self.requests[req_id]
+
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
@@ -1873,16 +1962,47 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             return 0
         if self._pause_state == PauseState.PAUSED_NEW:
-            return len(self.running)
+            return len(self.running) + len(self.batch_last)
         num_waiting = (
             len(self.waiting)
             + len(self.skipped_waiting)
             - self.num_waiting_for_streaming_input
         )
-        return num_waiting + len(self.running)
+        return num_waiting + len(self.running) + len(self.batch_last)
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
+
+    # ── Edge-cloud async scheduling interface methods ──
+
+    def push_batch_last(self, scheduler_output: SchedulerOutput) -> None:
+        """Push a SchedulerOutput whose first-stage (head) execution has
+        completed into the batch_last[] queue.
+
+        Called by EngineCore after batch_first execution finishes.
+        """
+        scheduler_output.first_stage_context = FirstStageContext(
+            orig_scheduler_output=scheduler_output,
+            enqueue_timestamp=time.monotonic(),
+        )
+        self.batch_last.append(scheduler_output)
+
+        # Mark all requests in this batch as HEAD_DONE
+        for req_id in scheduler_output.num_scheduled_tokens:
+            req = self.requests.get(req_id)
+            if req and req.status == RequestStatus.RUNNING:
+                req.status = RequestStatus.HEAD_DONE
+
+        logger.debug(
+            "[EdgeCloudSched] batch_first -> batch_last, depth=%d/%d",
+            len(self.batch_last), self.max_batch_last_depth,
+        )
+
+    def get_batch_last_depth(self) -> int:
+        return len(self.batch_last)
+
+    def has_head_done_requests(self) -> bool:
+        return bool(self.batch_last)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

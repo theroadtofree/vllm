@@ -202,6 +202,12 @@ class ParallelConfig:
     is_edge_node: bool = False
     """Whether this engine process belongs to the edge node."""
 
+    # ── Edge-cloud async scheduling (Phase 1+) ──
+    enable_edge_cloud_async_sched: bool = False
+    """Enable asynchronous head/tail scheduling in edge-cloud mode."""
+    max_batch_last_depth: int = 2
+    """Maximum depth of batch_last[] queue for async scheduling."""
+
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
     ubatch_size: int = 0
@@ -802,6 +808,17 @@ class ParallelConfig:
             self.tensor_parallel_size = (
                 self.edge_npu_count if self.is_edge_node else self.cloud_npu_count
             )
+
+        if self.enable_edge_cloud_async_sched:
+            if not self.enable_edge_cloud:
+                raise ValueError(
+                    "enable_edge_cloud_async_sched requires enable_edge_cloud=True"
+                )
+            if self.max_batch_last_depth < 1:
+                raise ValueError(
+                    "max_batch_last_depth must be >= 1 when "
+                    "enable_edge_cloud_async_sched=True"
+                )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")

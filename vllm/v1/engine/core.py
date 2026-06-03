@@ -48,7 +48,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import BatchType, SchedulerOutput
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
@@ -443,6 +443,11 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        # Empty batch: nothing to execute
+        if scheduler_output.batch_type == BatchType.EMPTY:
+            return {}, False
+
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -456,6 +461,17 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+
+        # ── Edge-cloud async: batch_first pushes to batch_last[] ──
+        if scheduler_output.batch_type == BatchType.FIRST:
+            # Head execution: update scheduler state (KV cache, computed tokens)
+            # but do not generate outputs or sample tokens.
+            self.scheduler.update_from_output(scheduler_output, model_output)
+            # Push the batch into batch_last[] for tail scheduling later.
+            self.scheduler.push_batch_last(scheduler_output)
+            return {}, True
+
+        # batch_last or standard mode: normal output processing
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )

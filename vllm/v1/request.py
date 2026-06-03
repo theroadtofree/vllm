@@ -322,8 +322,11 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
+    # ── Edge-cloud async scheduling ──
+    # Head layer execution completed, waiting for tail layer scheduling.
+    HEAD_DONE = enum.auto()
     # Note: anything after PREEMPTED will be considered
-    # as a finished status.
+    # as a finished status. HEAD_DONE is NOT a finished status.
     FINISHED_STOPPED = enum.auto()
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
@@ -336,6 +339,9 @@ class RequestStatus(enum.IntEnum):
 
     @staticmethod
     def is_finished(status: "RequestStatus") -> bool:
+        # HEAD_DONE is a transitional state, not a finished state.
+        if status == RequestStatus.HEAD_DONE:
+            return False
         return status > RequestStatus.PREEMPTED
 
     @staticmethod
