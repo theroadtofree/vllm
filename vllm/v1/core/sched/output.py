@@ -273,6 +273,9 @@ class SchedulerOutput:
     # Context from first-stage execution, passed to last-stage execution.
     # Only non-None when batch_type == LAST.
     first_stage_context: FirstStageContext | None = None
+    # Monotonically increasing step identifier, assigned sequentially
+    # (0, 1, 2, ...) each time a SchedulerOutput is constructed.
+    step_id: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
