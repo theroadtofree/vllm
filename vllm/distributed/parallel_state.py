@@ -356,6 +356,11 @@ class GroupCoordinator:
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
 
+        # Alternate communication groups for dual-channel edge-cloud transfer.
+        # Only populated for the PP group in edge-cloud mode.
+        self.alt_cpu_group: ProcessGroup | None = None
+        self.alt_device_group: ProcessGroup | None = None
+
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda_alike():
@@ -664,7 +669,7 @@ class GroupCoordinator:
         )
         return obj_list
 
-    def send_object(self, obj: Any, dst: int) -> None:
+    def send_object(self, obj: Any, dst: int, cpu_group_override=None) -> None:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
 
@@ -675,6 +680,8 @@ class GroupCoordinator:
             "as the current rank."
         )
 
+        cpu_group = cpu_group_override or self.cpu_group
+
         # Serialize object to tensor and get the size as well
         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
 
@@ -684,14 +691,14 @@ class GroupCoordinator:
 
         # Send object size
 
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=cpu_group)
 
         # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=cpu_group)
 
         return None
 
-    def recv_object(self, src: int) -> Any:
+    def recv_object(self, src: int, cpu_group_override=None) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
 
@@ -701,11 +708,13 @@ class GroupCoordinator:
             "Invalid source rank. Source rank is the same as the current rank."
         )
 
+        cpu_group = cpu_group_override or self.cpu_group
+
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
         rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
+            size_tensor, src=self.ranks[src], group=cpu_group
         )
 
         # Tensor to receive serialized objects into.
@@ -716,7 +725,7 @@ class GroupCoordinator:
         )
 
         rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
+            object_tensor, src=self.ranks[src], group=cpu_group
         )
 
         assert rank_object == rank_size, (
@@ -867,6 +876,7 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        channel: int = 0,
     ) -> list[Handle]:
         if self.world_size <= 1:
             return []
@@ -889,11 +899,15 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
-        metadata_group = self.cpu_group
+        if channel == 1 and self.alt_device_group is not None:
+            group = self.alt_device_group
+            metadata_group = self.alt_cpu_group
+        else:
+            group = self.device_group
+            metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        self.send_object(metadata_list, dst=dst, cpu_group_override=metadata_group)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -961,6 +975,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        channel: int = 0,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -987,10 +1002,14 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
-        metadata_group = self.cpu_group
+        if channel == 1 and self.alt_device_group is not None:
+            group = self.alt_device_group
+            metadata_group = self.alt_cpu_group
+        else:
+            group = self.device_group
+            metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self.recv_object(src=src, cpu_group_override=metadata_group)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
@@ -1067,7 +1086,22 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.recv(size, dtype, src)
 
+    def set_alternate_groups(
+        self,
+        alt_cpu_group: ProcessGroup,
+        alt_device_group: ProcessGroup,
+    ) -> None:
+        """Set alternate communication groups for dual-channel transfer."""
+        self.alt_cpu_group = alt_cpu_group
+        self.alt_device_group = alt_device_group
+
     def destroy(self):
+        if hasattr(self, "alt_device_group") and self.alt_device_group is not None:
+            torch.distributed.destroy_process_group(self.alt_device_group)
+            del self.alt_device_group
+        if hasattr(self, "alt_cpu_group") and self.alt_cpu_group is not None:
+            torch.distributed.destroy_process_group(self.alt_cpu_group)
+            del self.alt_cpu_group
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
@@ -1587,6 +1621,20 @@ def initialize_model_parallel(
             backend,
             group_name="pp",
         )
+
+        # Create alternate communication groups for dual-channel transfer.
+        # These are separate torch.distributed process groups with the same
+        # ranks but independent communication resources, enabling ping-pong
+        # overlap between edge and cloud.
+        pp_alt_device_group = torch.distributed.new_group(
+            pp_group_ranks, backend=backend
+        )
+        with suppress_stdout():
+            pp_alt_cpu_group = torch.distributed.new_group(
+                pp_group_ranks, backend="gloo"
+            )
+        if rank in pp_group_ranks:
+            _PP.set_alternate_groups(pp_alt_cpu_group, pp_alt_device_group)
 
         all_ranks = list(range(world_size))
         assert _DCP is None, "decode context model parallel group is already initialized"
