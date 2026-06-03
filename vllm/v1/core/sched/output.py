@@ -240,6 +240,10 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Monotonically increasing step identifier, assigned sequentially
+    # (0, 1, 2, ...) each time a SchedulerOutput is constructed.
+    step_id: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
