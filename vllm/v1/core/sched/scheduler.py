@@ -293,6 +293,7 @@ class Scheduler(SchedulerInterface):
             and getattr(
                 vllm_config.parallel_config, "enable_edge_cloud_async_sched", False
             )
+            and vllm_config.parallel_config.is_edge_node
         )
 
     def _mamba_block_aligned_split(
