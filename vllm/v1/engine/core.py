@@ -517,12 +517,20 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+
+            # ── Edge-cloud async: skip EMPTY batch ──
+            if scheduler_output.batch_type == BatchType.EMPTY:
+                return {}, False
+
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
             if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
+                model_executed = (
+                    scheduler_output.total_num_scheduled_tokens > 0
+                    and scheduler_output.batch_type != BatchType.FIRST
+                )
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
@@ -576,6 +584,16 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+
+        # ── Edge-cloud async: batch_first pushes to batch_last[] ──
+        if scheduler_output.batch_type == BatchType.FIRST:
+            # Head execution: update scheduler state (KV cache, computed tokens)
+            # but do not generate outputs or sample tokens.
+            self.scheduler.update_from_output(scheduler_output, model_output)
+            # Push the batch into batch_last[] for tail scheduling later.
+            self.scheduler.push_batch_last(scheduler_output)
+            return {}, True
+
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
