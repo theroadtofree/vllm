@@ -167,6 +167,11 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Edge-cloud split inference: whether the first-layer execution on the
+        # edge device has completed and the request is waiting for last-layer
+        # execution. Defaults to False (new requests start with first layer).
+        self.ec_first_layer_completed: bool = False
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []

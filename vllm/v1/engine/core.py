@@ -48,7 +48,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import ECExecPhase, SchedulerOutput
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
@@ -74,7 +74,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
@@ -444,6 +444,29 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+
+        # Edge-cloud split inference: handle phase-specific execution
+        from vllm.distributed.parallel_state import is_cloud_device, is_edge_device
+
+        ec_phase = scheduler_output.ec_exec_phase
+
+        # Edge device FIRST_LAYERS: hidden states sent to cloud, no sampling
+        if ec_phase == ECExecPhase.FIRST_LAYERS and is_edge_device():
+            future.result()  # wait for execution to complete
+            # update_from_output will detect FIRST_LAYERS phase on edge
+            # and skip normal output processing, just moving requests to
+            # the last-layer queue.
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT
+            )
+            return engine_core_outputs, True
+
+        # Cloud device LAST_LAYERS: nothing to execute
+        if ec_phase == ECExecPhase.LAST_LAYERS and is_cloud_device():
+            future.result()
+            return {}, False
+
+        # Normal path (including edge LAST_LAYERS which produces final output)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
@@ -501,6 +524,32 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+
+            # Edge-cloud split inference: phase-specific handling
+            ec_phase = scheduler_output.ec_exec_phase
+            from vllm.distributed.parallel_state import is_cloud_device, is_edge_device
+
+            # Edge device FIRST_LAYERS: no sampling, just move to last-layer
+            if ec_phase == ECExecPhase.FIRST_LAYERS and is_edge_device():
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                exec_future.result()
+                engine_core_outputs = self.scheduler.update_from_output(
+                    scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT
+                )
+                return engine_core_outputs, True
+
+            # Cloud device LAST_LAYERS: nothing to do
+            if ec_phase == ECExecPhase.LAST_LAYERS and is_cloud_device():
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                exec_future.result()
+                return {}, False
+
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True

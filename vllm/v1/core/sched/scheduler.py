@@ -38,6 +38,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    ECExecPhase,
     GrammarOutput,
     NewRequestData,
     SchedulerOutput,
@@ -168,6 +169,12 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Edge-cloud split inference: queue of requests that have completed
+        # their first-layer pass and are waiting for last-layer execution.
+        self.ec_last_layer_queue: list[Request] = []
+        # Current execution phase for edge-cloud split inference.
+        self._ec_current_phase: ECExecPhase = ECExecPhase.NONE
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -329,7 +336,38 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _determine_ec_phase(self) -> ECExecPhase:
+        """Determine whether to schedule first-layer or last-layer execution.
+
+        Interleaving strategy: prefer scheduling first-layer steps for new
+        requests, and interleave last-layer steps when requests are waiting.
+        Target scheduling pattern for 4 requests:
+        SO1首, SO2首, SO1尾, SO3首, SO2尾, SO4首, SO3尾, SO4尾
+        i.e., every 2 first-layer steps, insert 1 last-layer step when
+        the last-layer queue is non-empty.
+        """
+        from vllm.distributed.parallel_state import is_edge_device
+
+        if not self.parallel_config.enable_edge_cloud or not is_edge_device():
+            return ECExecPhase.NONE
+
+        has_waiting = bool(self.waiting) or bool(self.skipped_waiting)
+        has_last_layer = bool(self.ec_last_layer_queue)
+
+        if not has_last_layer:
+            return ECExecPhase.FIRST_LAYERS
+        if not has_waiting:
+            return ECExecPhase.LAST_LAYERS
+        # Both queues have work: interleave
+        # Use step_id % 3 == 2 to insert 1 last-layer step per 3 steps
+        if self._step_id % 3 == 2:
+            return ECExecPhase.LAST_LAYERS
+        return ECExecPhase.FIRST_LAYERS
+
     def schedule(self) -> SchedulerOutput:
+        # Determine the execution phase for this step (edge-cloud split)
+        self._ec_current_phase = self._determine_ec_phase()
+
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -545,7 +583,34 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        # In edge-cloud split inference LAST_LAYERS phase, schedule from the
+        # ec_last_layer_queue instead of the normal waiting queue.
+        if (
+            self._ec_current_phase == ECExecPhase.LAST_LAYERS
+            and self.parallel_config.enable_edge_cloud
+        ):
+            # Schedule requests from the last-layer queue
+            for request in self.ec_last_layer_queue:
+                if token_budget <= 0:
+                    break
+                num_new_tokens = 1  # decode: 1 token per step
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                with record_function_or_nullcontext(
+                    "schedule: allocate_slots_last_layer"
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                    )
+
+                if new_blocks is not None:
+                    scheduled_running_reqs.append(request)
+                    req_to_new_blocks[request.request_id] = new_blocks
+                    num_scheduled_tokens[request.request_id] = num_new_tokens
+                    token_budget -= num_new_tokens
+
+        elif not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -904,6 +969,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             step_id=self._step_id,
+            ec_exec_phase=self._ec_current_phase,
         )
         self._step_id += 1
 
@@ -1290,6 +1356,28 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # Edge-cloud split inference: handle phase-specific output processing
+        ec_phase = scheduler_output.ec_exec_phase
+        if ec_phase == ECExecPhase.FIRST_LAYERS:
+            from vllm.distributed.parallel_state import is_edge_device
+
+            if is_edge_device():
+                # Edge first-layer step: hidden states sent to cloud,
+                # no sampled tokens produced. Mark requests for last-layer.
+                for req_id in scheduler_output.num_scheduled_tokens:
+                    request = self.requests.get(req_id)
+                    if request and not request.ec_first_layer_completed:
+                        request.ec_first_layer_completed = True
+                        self.ec_last_layer_queue.append(request)
+                return {}
+
+        if ec_phase == ECExecPhase.LAST_LAYERS:
+            from vllm.distributed.parallel_state import is_cloud_device
+
+            if is_cloud_device():
+                # Cloud last-layer step: nothing to process
+                return {}
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1533,6 +1621,11 @@ class Scheduler(SchedulerInterface):
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
+            # Also clean up the edge-cloud last-layer queue
+            self.ec_last_layer_queue = [
+                r for r in self.ec_last_layer_queue
+                if r not in stopped_running_reqs
+            ]
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -1604,6 +1697,24 @@ class Scheduler(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        # Edge-cloud split inference: after a last-layer step completes,
+        # reset the request's phase so it can be scheduled for the next
+        # first-layer step in the decode loop.
+        if (
+            self.parallel_config.enable_edge_cloud
+            and ec_phase == ECExecPhase.LAST_LAYERS
+        ):
+            for req_id in num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if (
+                    request
+                    and request.ec_first_layer_completed
+                    and not request.is_finished()
+                ):
+                    request.ec_first_layer_completed = False
+                    if request in self.ec_last_layer_queue:
+                        self.ec_last_layer_queue.remove(request)
 
         return engine_core_outputs
 

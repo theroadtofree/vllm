@@ -134,7 +134,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import ECExecPhase, NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -219,7 +219,10 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.core.sched.output import (
+        GrammarOutput,
+        SchedulerOutput,
+    )
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
@@ -4185,9 +4188,16 @@ class GPUModelRunner(
 
             if not self.broadcast_pp_output:
                 # Common case.
+                # Edge-cloud split inference: only return intermediate tensors
+                # for FIRST_LAYERS phase on edge device. LAST_LAYERS phase
+                # should fall through to sampling (producing final output).
+                ec_is_first_layer_step = (
+                    is_edge_cloud_first_stage(intermediate_tensors)
+                    and scheduler_output.ec_exec_phase == ECExecPhase.FIRST_LAYERS
+                )
                 if (
                     not get_pp_group().is_last_rank
-                    or is_edge_cloud_first_stage(intermediate_tensors)
+                    or ec_is_first_layer_step
                 ):
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)

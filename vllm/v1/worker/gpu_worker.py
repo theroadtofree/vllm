@@ -35,6 +35,8 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    is_cloud_device,
+    is_edge_device,
 )
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
@@ -48,9 +50,10 @@ from vllm.tracing import instrument
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import ECExecPhase, GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -789,6 +792,84 @@ class Worker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
+        ec_phase = scheduler_output.ec_exec_phase
+
+        # Edge-cloud split inference phase-based execution
+        if is_edge_device():
+            if ec_phase == ECExecPhase.FIRST_LAYERS:
+                # Edge FIRST_LAYERS: run model forward, send hidden to cloud,
+                # return
+                with self.annotate_profile(scheduler_output):
+                    output = self.model_runner.execute_model(
+                        scheduler_output, None  # No intermediate tensors
+                    )
+                assert isinstance(output, IntermediateTensors)
+                # Send intermediate tensors to cloud
+                self._pp_send_work = get_pp_group().isend_tensor_dict(
+                    output.tensors,
+                    all_gather_group=get_tp_group(),
+                )
+                return None
+
+            elif ec_phase == ECExecPhase.LAST_LAYERS:
+                # Edge LAST_LAYERS: receive hidden from cloud, run model
+                # forward
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                    )
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
+                with self.annotate_profile(scheduler_output):
+                    output = self.model_runner.execute_model(
+                        scheduler_output, intermediate_tensors
+                    )
+                if (
+                    self.use_v2_model_runner
+                    and self.model_runner.is_pooling_model
+                    and output is None
+                ):
+                    output = self.model_runner.pool()  # type: ignore
+                # Last-layer produces final output with logits
+                return output
+
+        elif is_cloud_device():
+            if ec_phase == ECExecPhase.FIRST_LAYERS:
+                # Cloud FIRST_LAYERS: receive hidden from edge, run middle
+                # layers, send result back to edge
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                    )
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
+                with self.annotate_profile(scheduler_output):
+                    output = self.model_runner.execute_model(
+                        scheduler_output, intermediate_tensors
+                    )
+                assert isinstance(output, IntermediateTensors)
+                # Send intermediate tensors back to edge
+                self._pp_send_work = get_pp_group().isend_tensor_dict(
+                    output.tensors,
+                    all_gather_group=get_tp_group(),
+                )
+                return None
+
+            elif ec_phase == ECExecPhase.LAST_LAYERS:
+                # Cloud LAST_LAYERS: do nothing, return directly
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+        # Non-EC mode or ECExecPhase.NONE: original logic
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens

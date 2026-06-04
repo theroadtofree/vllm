@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -177,6 +178,17 @@ class CachedRequestData:
         )
 
 
+class ECExecPhase(enum.IntEnum):
+    """Edge-cloud split inference execution phase.
+
+    Indicates whether the current scheduling step executes the first layers
+    (首层) or the last layers (尾层) on the edge device.
+    """
+    NONE = 0         # Non-EC mode, or cloud worker step with no action needed
+    FIRST_LAYERS = 1 # Edge executes first layers, sends hidden to cloud
+    LAST_LAYERS = 2  # Edge receives hidden from cloud, executes last layers
+
+
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -243,6 +255,12 @@ class SchedulerOutput:
     # Monotonically increasing step identifier, assigned sequentially
     # (0, 1, 2, ...) each time a SchedulerOutput is constructed.
     step_id: int = 0
+
+    # Edge-cloud split inference execution phase.
+    # Indicates whether this step executes first layers (首层) or last
+    # layers (尾层) on the edge device. NONE for non-EC mode or cloud
+    # worker steps that require no action.
+    ec_exec_phase: ECExecPhase = ECExecPhase.NONE
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
