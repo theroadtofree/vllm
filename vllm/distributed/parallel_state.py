@@ -28,6 +28,7 @@ import gc
 import pickle
 import weakref
 import threading
+import queue
 from collections import namedtuple
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -288,15 +289,14 @@ direct_register_custom_op(
 )
 
 class AsyncWork:
-    def __init__(self,thread,done_event,err_ref):
-        self.thread = thread
+    def __init__(self, done_event, err_ref):
         self.done_event = done_event
         self.err_ref = err_ref
 
     def is_completed(self):
         return self.done_event.is_set()
 
-    def wait(self,timeout=None):
+    def wait(self, timeout=None):
         finish = self.done_event.wait(timeout=timeout)
         if not finish:
             raise TimeoutError("AsyncWork timeout.")
@@ -304,35 +304,72 @@ class AsyncWork:
             raise self.err_ref[0]
         return True
 
-def thread_target_send(tensor, dst, group, done_evt, err_ref):
-    try:
-        torch.distributed.send(tensor, dst, group)
-    except Exception as e:
-        err_ref.append(e)
-    finally:
-        done_evt.set()
 
-def thread_target_recv(tensor, src, group, done_evt, err_ref):
-    try:
-        torch.distributed.recv(tensor, src, group)
-    except Exception as e:
-        err_ref.append(e)
-    finally:
-        done_evt.set()
+@dataclass
+class _SendTask:
+    tensor: torch.Tensor
+    dst: int
+    group: Any
+    done_event: threading.Event
+    err_ref: list
+
+
+@dataclass
+class _RecvTask:
+    tensor: torch.Tensor
+    src: int
+    group: Any
+    done_event: threading.Event
+    err_ref: list
+
+
+def _send_worker(send_queue: queue.Queue):
+    while True:
+        task = send_queue.get()
+        try:
+            torch.distributed.send(task.tensor, task.dst, task.group)
+        except Exception as e:
+            task.err_ref.append(e)
+        finally:
+            task.done_event.set()
+
+
+def _recv_worker(recv_queue: queue.Queue):
+    while True:
+        task = recv_queue.get()
+        try:
+            torch.distributed.recv(task.tensor, task.src, task.group)
+        except Exception as e:
+            task.err_ref.append(e)
+        finally:
+            task.done_event.set()
+
+
+# 两个常驻 daemon 线程,随进程退出自动消亡。
+# 线程安全队列 + FIFO 消费保证了同一个 peer 对端的 send/recv 顺序。
+_send_queue: queue.Queue = queue.Queue()
+_recv_queue: queue.Queue = queue.Queue()
+
+_send_thread = threading.Thread(
+    target=_send_worker, args=(_send_queue,), daemon=True, name="t_isend"
+)
+_recv_thread = threading.Thread(
+    target=_recv_worker, args=(_recv_queue,), daemon=True, name="t_irecv"
+)
+_send_thread.start()
+_recv_thread.start()
+
 
 def t_isend(tensor, dst, group=None):
     done_evt, err_ref = threading.Event(), []
+    _send_queue.put(_SendTask(tensor, dst, group, done_evt, err_ref))
+    return AsyncWork(done_evt, err_ref)
 
-    thread = threading.Thread(target=thread_target_send, args=(tensor, dst, group, done_evt, err_ref))
-    thread.start()
-    return AsyncWork(thread, done_evt, err_ref)
 
 def t_irecv(tensor, src, group=None):
     done_evt, err_ref = threading.Event(), []
-
-    thread = threading.Thread(target=thread_target_recv, args=(tensor, src, group, done_evt, err_ref))
-    thread.start()
-    return AsyncWork(thread, done_evt, err_ref)
+    _recv_queue.put(_RecvTask(tensor, src, group, done_evt, err_ref))
+    return AsyncWork(done_evt, err_ref)
 
 class GroupCoordinator:
     """
