@@ -733,12 +733,24 @@ class GroupCoordinator:
 
         #torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
         size_send_req = t_isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-        size_send_req.wait()
 
         # Send object
         #torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
         object_send_req = t_isend(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
-        object_send_req.wait()
+
+        # 不 wait,主线程继续执行。
+        # 必须把 tensor 和 work 一起挂在实例上,保证底层 buffer 在传输完成前不被 GC。
+        if not hasattr(self, "_pending_sends"):
+            self._pending_sends = []
+        self._pending_sends.append(
+            (size_send_req, size_tensor, object_send_req, object_tensor)
+        )
+
+        # 顺便清理已完成的,避免队列无限增长。
+        self._pending_sends = [
+            t for t in self._pending_sends
+            if not (t[0].is_completed() and t[2].is_completed())
+        ]
 
         return None
 
