@@ -300,8 +300,8 @@ class AsyncWork:
         finish = self.done_event.wait(timeout=timeout)
         if not finish:
             raise TimeoutError("AsyncWork timeout.")
-        if self.err_ref is not None and self.err_ref.value is not None:
-            raise self.err_ref.value
+        if self.err_ref is not None:
+            raise self.err_ref[0]
         return True
 
 def thread_target_send(tensor, dst, group, done_evt, err_ref):
