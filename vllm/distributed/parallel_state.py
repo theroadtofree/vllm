@@ -300,7 +300,7 @@ class AsyncWork:
         finish = self.done_event.wait(timeout=timeout)
         if not finish:
             raise TimeoutError("AsyncWork timeout.")
-        if self.err_ref is not None:
+        if self.err_ref:
             raise self.err_ref[0]
         return True
 
@@ -732,11 +732,13 @@ class GroupCoordinator:
         # Send object size
 
         #torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-        t_isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        size_send_req = t_isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        size_send_req.wait()
 
         # Send object
         #torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
-        t_isend(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        object_send_req = t_isend(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        object_send_req.wait()
 
         return None
 
@@ -758,7 +760,6 @@ class GroupCoordinator:
         #)
         rank_size_recv_req = t_irecv(size_tensor, src=self.ranks[src], group=self.cpu_group)
         rank_size_recv_req.wait()
-        rank_size = size_tensor.item()
 
                # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
@@ -772,11 +773,10 @@ class GroupCoordinator:
         #)
         rank_object_recv_req = t_irecv(object_tensor, src=self.ranks[src], group=self.cpu_group)
         rank_object_recv_req.wait()
-        rank_object = object_tensor.item()
 
-        assert rank_object == rank_size, (
-            "Received object sender rank does not match the size sender rank."
-        )
+        #assert rank_object == rank_size, (
+        #    "Received object sender rank does not match the size sender rank."
+        #)
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
