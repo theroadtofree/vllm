@@ -27,6 +27,7 @@ import contextlib
 import gc
 import pickle
 import weakref
+import threading
 from collections import namedtuple
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -286,6 +287,52 @@ direct_register_custom_op(
     fake_impl=patched_fused_scaled_matmul_reduce_scatter_fake,
 )
 
+class AsyncWork:
+    def __init__(self,thread,done_event,err_ref):
+        self.thread = thread
+        self.done_event = done_event
+        self.err_ref = err_ref
+
+    def is_completed(self):
+        return self.done_event.is_set()
+
+    def wait(self,timeout=None):
+        finish = self.done_event.wait(timeout=timeout)
+        if not finish:
+            raise TimeoutError("AsyncWork timeout.")
+        if self.err_ref is not None and self.err_ref.value is not None:
+            raise self.err_ref.value
+        return True
+
+def thread_target_send(tensor, dst, group, done_evt, err_ref):
+    try:
+        torch.distributed.send(tensor, dst, group)
+    except Exception as e:
+        err_ref.append(e)
+    finally:
+        done_evt.set()
+
+def thread_target_recv(tensor, src, group, done_evt, err_ref):
+    try:
+        torch.distributed.recv(tensor, src, group)
+    except Exception as e:
+        err_ref.append(e)
+    finally:
+        done_evt.set()
+
+def t_isend(tensor, dst, group=None):
+    done_evt, err_ref = threading.Event(), []
+
+    thread = threading.Thread(target=thread_target_send, args=(tensor, dst, group, done_evt, err_ref))
+    thread.start()
+    return AsyncWork(thread, done_evt, err_ref)
+
+def t_irecv(tensor, src, group=None):
+    done_evt, err_ref = threading.Event(), []
+
+    thread = threading.Thread(target=thread_target_recv, args=(tensor, src, group, done_evt, err_ref))
+    thread.start()
+    return AsyncWork(thread, done_evt, err_ref)
 
 class GroupCoordinator:
     """
@@ -684,10 +731,12 @@ class GroupCoordinator:
 
         # Send object size
 
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        #torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        t_isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        #torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        t_isend(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         return None
 
@@ -704,20 +753,26 @@ class GroupCoordinator:
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        #rank_size = torch.distributed.recv(
+        #    size_tensor, src=self.ranks[src], group=self.cpu_group
+        #)
+        rank_size_recv_req = t_irecv(size_tensor, src=self.ranks[src], group=self.cpu_group)
+        rank_size_recv_req.wait()
+        rank_size = size_tensor.item()
 
-        # Tensor to receive serialized objects into.
+               # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
             device="cpu",
         )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        #rank_object = torch.distributed.recv(
+        #    object_tensor, src=self.ranks[src], group=self.cpu_group
+        #)
+        rank_object_recv_req = t_irecv(object_tensor, src=self.ranks[src], group=self.cpu_group)
+        rank_object_recv_req.wait()
+        rank_object = object_tensor.item()
 
         assert rank_object == rank_size, (
             "Received object sender rank does not match the size sender rank."
