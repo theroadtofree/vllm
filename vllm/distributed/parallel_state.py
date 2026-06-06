@@ -27,6 +27,8 @@ import contextlib
 import gc
 import pickle
 import weakref
+import threading
+import queue
 from collections import namedtuple
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -286,6 +288,88 @@ direct_register_custom_op(
     fake_impl=patched_fused_scaled_matmul_reduce_scatter_fake,
 )
 
+class AsyncWork:
+    def __init__(self, done_event, err_ref):
+        self.done_event = done_event
+        self.err_ref = err_ref
+
+    def is_completed(self):
+        return self.done_event.is_set()
+
+    def wait(self, timeout=None):
+        finish = self.done_event.wait(timeout=timeout)
+        if not finish:
+            raise TimeoutError("AsyncWork timeout.")
+        if self.err_ref:
+            raise self.err_ref[0]
+        return True
+
+
+@dataclass
+class _SendTask:
+    tensor: torch.Tensor
+    dst: int
+    group: Any
+    done_event: threading.Event
+    err_ref: list
+
+
+@dataclass
+class _RecvTask:
+    tensor: torch.Tensor
+    src: int
+    group: Any
+    done_event: threading.Event
+    err_ref: list
+
+
+def _send_worker(send_queue: queue.Queue):
+    while True:
+        task = send_queue.get()
+        try:
+            torch.distributed.send(task.tensor, task.dst, task.group)
+        except Exception as e:
+            task.err_ref.append(e)
+        finally:
+            task.done_event.set()
+
+
+def _recv_worker(recv_queue: queue.Queue):
+    while True:
+        task = recv_queue.get()
+        try:
+            torch.distributed.recv(task.tensor, task.src, task.group)
+        except Exception as e:
+            task.err_ref.append(e)
+        finally:
+            task.done_event.set()
+
+
+# 两个常驻 daemon 线程,随进程退出自动消亡。
+# 线程安全队列 + FIFO 消费保证了同一个 peer 对端的 send/recv 顺序。
+_send_queue: queue.Queue = queue.Queue()
+_recv_queue: queue.Queue = queue.Queue()
+
+_send_thread = threading.Thread(
+    target=_send_worker, args=(_send_queue,), daemon=True, name="t_isend"
+)
+_recv_thread = threading.Thread(
+    target=_recv_worker, args=(_recv_queue,), daemon=True, name="t_irecv"
+)
+_send_thread.start()
+_recv_thread.start()
+
+
+def t_isend(tensor, dst, group=None):
+    done_evt, err_ref = threading.Event(), []
+    _send_queue.put(_SendTask(tensor, dst, group, done_evt, err_ref))
+    return AsyncWork(done_evt, err_ref)
+
+
+def t_irecv(tensor, src, group=None):
+    done_evt, err_ref = threading.Event(), []
+    _recv_queue.put(_RecvTask(tensor, src, group, done_evt, err_ref))
+    return AsyncWork(done_evt, err_ref)
 
 class GroupCoordinator:
     """
@@ -684,10 +768,26 @@ class GroupCoordinator:
 
         # Send object size
 
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        #torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        size_send_req = t_isend(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        #torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+        object_send_req = t_isend(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+
+        # 不 wait,主线程继续执行。
+        # 必须把 tensor 和 work 一起挂在实例上,保证底层 buffer 在传输完成前不被 GC。
+        if not hasattr(self, "_pending_sends"):
+            self._pending_sends = []
+        self._pending_sends.append(
+            (size_send_req, size_tensor, object_send_req, object_tensor)
+        )
+
+        # 顺便清理已完成的,避免队列无限增长。
+        self._pending_sends = [
+            t for t in self._pending_sends
+            if not (t[0].is_completed() and t[2].is_completed())
+        ]
 
         return None
 
@@ -704,24 +804,28 @@ class GroupCoordinator:
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        #rank_size = torch.distributed.recv(
+        #    size_tensor, src=self.ranks[src], group=self.cpu_group
+        #)
+        rank_size_recv_req = t_irecv(size_tensor, src=self.ranks[src], group=self.cpu_group)
+        rank_size_recv_req.wait()
 
-        # Tensor to receive serialized objects into.
+               # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
             device="cpu",
         )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        #rank_object = torch.distributed.recv(
+        #    object_tensor, src=self.ranks[src], group=self.cpu_group
+        #)
+        rank_object_recv_req = t_irecv(object_tensor, src=self.ranks[src], group=self.cpu_group)
+        rank_object_recv_req.wait()
 
-        assert rank_object == rank_size, (
-            "Received object sender rank does not match the size sender rank."
-        )
+        #assert rank_object == rank_size, (
+        #    "Received object sender rank does not match the size sender rank."
+        #)
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
