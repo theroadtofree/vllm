@@ -810,7 +810,7 @@ class GroupCoordinator:
         rank_size_recv_req = t_irecv(size_tensor, src=self.ranks[src], group=self.cpu_group)
         rank_size_recv_req.wait()
 
-               # Tensor to receive serialized objects into.
+        # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
