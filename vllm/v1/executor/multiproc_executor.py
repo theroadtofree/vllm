@@ -1109,6 +1109,39 @@ class WorkerProc:
 
             # Poll cross-node MQ with short timeout so we can
             # periodically check the local MQ.
+            
+            # Print pending methods in rpc_broadcast_mq if any
+            mq = self.rpc_broadcast_mq
+            if mq._is_local_reader and mq.buffer is not None:
+                pending_methods = []
+                for idx in range(mq.buffer.max_chunks):
+                    with mq.buffer.get_metadata(idx) as metadata_buffer:
+                        from vllm.distributed.device_communicators.shm_broadcast import (
+                            memory_fence,
+                            from_bytes_big,
+                        )
+                        memory_fence()
+                        written_flag = metadata_buffer[0]
+                        read_flag = metadata_buffer[mq.local_reader_rank + 1]
+                        if written_flag and not read_flag:
+                            with mq.buffer.get_data(idx) as data_buffer:
+                                overflow = data_buffer[0] == 1
+                                if not overflow:
+                                    offset = 3
+                                    buf_count = from_bytes_big(data_buffer[1:offset])
+                                    all_buffers = []
+                                    for i in range(buf_count):
+                                        buf_offset = offset + 4
+                                        buf_len = from_bytes_big(data_buffer[offset:buf_offset])
+                                        offset = buf_offset + buf_len
+                                        all_buffers.append(data_buffer[buf_offset:offset])
+                                    import pickle
+                                    obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
+                                    method_name = obj[0] if isinstance(obj, tuple) else str(obj)
+                                    pending_methods.append(method_name)
+                if pending_methods:
+                    print(f"[DEBUG] Pending methods in rpc_broadcast_mq: {pending_methods}")
+            
             try:
                 method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                     timeout=0.1
