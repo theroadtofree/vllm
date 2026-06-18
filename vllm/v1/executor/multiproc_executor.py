@@ -1056,22 +1056,6 @@ class WorkerProc:
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
-                        logger.info(
-                            "PP worker received SchedulerOutput from local "
-                            "enginecore: total_scheduled_tokens=%d, "
-                            "new_reqs=%d, cached_reqs=%d, "
-                            "finished_req_ids=%s"
-                            + (
-                                f", slice={slice_info.slice_index + 1}/{slice_info.total_slices}"
-                                f" layers=[{slice_info.start_layer},{slice_info.end_layer})"
-                                if slice_info is not None
-                                else ""
-                            ),
-                            scheduler_output.total_num_scheduled_tokens,
-                            len(scheduler_output.scheduled_new_reqs),
-                            scheduler_output.scheduled_cached_reqs.num_reqs,
-                            scheduler_output.finished_req_ids,
-                        )
                         # Execute model with the received SchedulerOutput.
                         try:
                             func = getattr(self.worker, "execute_model")

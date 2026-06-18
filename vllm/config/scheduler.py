@@ -154,10 +154,6 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
-    enable_pd_separation: bool = False
-    """If True, the scheduler will separate prefill and decode requests
-    into different steps, avoiding PD-mixed batches."""
-
     pd_scheduling_policy: Literal["prefill_first", "decode_first", "strict_alternation"] = "prefill_first"
     """The scheduling policy to use when PD separation is enabled:
     - "prefill_first": prioritize prefill requests over decode requests.
@@ -183,12 +179,6 @@ class SchedulerConfig:
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
-            if self.enable_pd_separation:
-                raise ValueError(
-                    "scheduler_config.enable_pd_separation requires a custom "
-                    "scheduler_cls provided by the hardware plugin. The PD "
-                    "scheduler implementation is not owned by vLLM core."
-                )
             if self.async_scheduling:
                 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 

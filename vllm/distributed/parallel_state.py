@@ -331,11 +331,6 @@ class GroupCoordinator:
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
-        # Store all group_ranks so that create_alternate_groups can
-        # iterate over every subgroup — torch.distributed.new_group
-        # is a collective on the default group and must be called by
-        # every rank, even for subgroups it does not belong to.
-        self._all_group_ranks = group_ranks
 
         self_device_group = None
         self_cpu_group = None
@@ -360,13 +355,6 @@ class GroupCoordinator:
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
-
-        # Alternate device/cpu groups for dual-channel PP communication.
-        # When set, these provide a second independent communication channel
-        # over the same ranks. Used in PP to separate decode from
-        # non-decode traffic.
-        self.alt_device_group: ProcessGroup | None = None
-        self.alt_cpu_group: ProcessGroup | None = None
 
         from vllm.platforms import current_platform
 
@@ -411,43 +399,6 @@ class GroupCoordinator:
             and self.device_communicator
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
-
-    def create_alternate_groups(
-        self,
-        torch_distributed_backend: str | Backend,
-    ) -> None:
-        """Create alternate device and cpu groups over the same ranks.
-
-        Must be called collectively by all ranks in the **default** group
-        (i.e. every rank that participates in ``torch.distributed``), because
-        ``torch.distributed.new_group`` is a collective operation on the
-        default group. After calling this, communication methods can use
-        ``use_alt_group=True`` to route through the alternate
-        communication channel.
-        """
-        assert self.alt_device_group is None, (
-            "Alternate groups already created"
-        )
-        self_alt_device_group = None
-        self_alt_cpu_group = None
-        # Iterate over ALL subgroups so that every rank participates in
-        # every new_group call (required because new_group is collective
-        # on the default group).  Only save the group this rank belongs to.
-        for ranks in self._all_group_ranks:
-            alt_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            with suppress_stdout():
-                alt_cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo"
-                )
-            if self.rank in ranks:
-                self_alt_device_group = alt_device_group
-                self_alt_cpu_group = alt_cpu_group
-        assert self_alt_device_group is not None
-        assert self_alt_cpu_group is not None
-        self.alt_device_group = self_alt_device_group
-        self.alt_cpu_group = self_alt_cpu_group
 
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
@@ -713,7 +664,7 @@ class GroupCoordinator:
         )
         return obj_list
 
-    def send_object(self, obj: Any, dst: int, use_alt_group: bool = False) -> None:
+    def send_object(self, obj: Any, dst: int) -> None:
         """Send the input object list to the destination rank."""
         """NOTE: `dst` is the local rank of the destination rank."""
 
@@ -724,8 +675,6 @@ class GroupCoordinator:
             "as the current rank."
         )
 
-        cpu_group = self.alt_cpu_group if use_alt_group else self.cpu_group
-
         # Serialize object to tensor and get the size as well
         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
 
@@ -735,14 +684,14 @@ class GroupCoordinator:
 
         # Send object size
 
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=cpu_group)
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=cpu_group)
+        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         return None
 
-    def recv_object(self, src: int, use_alt_group: bool = False) -> Any:
+    def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
 
@@ -752,13 +701,11 @@ class GroupCoordinator:
             "Invalid source rank. Source rank is the same as the current rank."
         )
 
-        cpu_group = self.alt_cpu_group if use_alt_group else self.cpu_group
-
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
         rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=cpu_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
         # Tensor to receive serialized objects into.
@@ -769,7 +716,7 @@ class GroupCoordinator:
         )
 
         rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=cpu_group
+            object_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
         assert rank_object == rank_size, (
@@ -882,7 +829,6 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
-        use_alt_group: bool = False,
     ) -> dict[str, torch.Tensor | Any] | None:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -901,9 +847,6 @@ class GroupCoordinator:
             the residual tensor when sequence parallelism is enabled). This
             dictionary allows overriding the default behavior on a per-tensor
             basis.
-        use_alt_group: If True, use the alternate device/cpu groups for
-            communication. Requires ``create_alternate_groups`` to have been
-            called first.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -913,7 +856,6 @@ class GroupCoordinator:
             dst=dst,
             all_gather_group=all_gather_group,
             all_gather_tensors=all_gather_tensors,
-            use_alt_group=use_alt_group,
         )
         for handle in handles:
             handle.wait()
@@ -925,7 +867,6 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
-        use_alt_group: bool = False,
     ) -> list[Handle]:
         if self.world_size <= 1:
             return []
@@ -948,19 +889,11 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        if use_alt_group:
-            assert self.alt_device_group is not None, (
-                "Alternate groups not created. "
-                "Call create_alternate_groups() first."
-            )
-            group = self.alt_device_group
-            metadata_group = self.alt_cpu_group
-        else:
-            group = self.device_group
-            metadata_group = self.cpu_group
+        group = self.device_group
+        metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst, use_alt_group=use_alt_group)
+        self.send_object(metadata_list, dst=dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -981,8 +914,6 @@ class GroupCoordinator:
             )
             if tensor.is_cuda:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            elif tensor.device.type == "npu":
-                tensor.record_stream(torch.npu.current_stream(tensor.device))
             handles.append(handle)
 
         return handles
@@ -992,7 +923,6 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
-        use_alt_group: bool = False,
     ) -> dict[str, torch.Tensor | Any] | None:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1011,9 +941,6 @@ class GroupCoordinator:
             the residual tensor when sequence parallelism is enabled). This
             dictionary allows overriding the default behavior on a per-tensor
             basis.
-        use_alt_group: If True, use the alternate device/cpu groups for
-            communication. Requires ``create_alternate_groups`` to have been
-            called first.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -1022,7 +949,6 @@ class GroupCoordinator:
             src=src,
             all_gather_group=all_gather_group,
             all_gather_tensors=all_gather_tensors,
-            use_alt_group=use_alt_group,
         )
         for handle in handles:
             handle.wait()
@@ -1035,7 +961,6 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
-        use_alt_group: bool = False,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1062,18 +987,10 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        if use_alt_group:
-            assert self.alt_device_group is not None, (
-                "Alternate groups not created. "
-                "Call create_alternate_groups() first."
-            )
-            group = self.alt_device_group
-            metadata_group = self.alt_cpu_group
-        else:
-            group = self.device_group
-            metadata_group = self.cpu_group
+        group = self.device_group
+        metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src, use_alt_group=use_alt_group)
+        recv_metadata_list = self.recv_object(src=src)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
@@ -1157,12 +1074,6 @@ class GroupCoordinator:
         if hasattr(self, "cpu_group"):
             torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.alt_device_group is not None:
-            torch.distributed.destroy_process_group(self.alt_device_group)
-            self.alt_device_group = None
-        if self.alt_cpu_group is not None:
-            torch.distributed.destroy_process_group(self.alt_cpu_group)
-            self.alt_cpu_group = None
         if self.device_communicator is not None:
             self.device_communicator.destroy()
         if self.mq_broadcaster is not None:

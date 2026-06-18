@@ -453,7 +453,6 @@ class EngineArgs:
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
-    cloud_addr: str | None = ParallelConfig.cloud_addr
     nnodes: int = ParallelConfig.nnodes
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
@@ -481,7 +480,6 @@ class EngineArgs:
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     enable_edge_cloud: bool = ParallelConfig.enable_edge_cloud
-    enable_pd_separation: bool = ParallelConfig.enable_pd_separation
     edge_npu_count: int = ParallelConfig.edge_npu_count
     cloud_npu_count: int = ParallelConfig.cloud_npu_count
     enable_dbo: bool = ParallelConfig.enable_dbo
@@ -598,7 +596,6 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     pd_scheduling_policy: str = SchedulerConfig.pd_scheduling_policy
-    pd_prefill_inflight_limit: int = SchedulerConfig.pd_prefill_inflight_limit
 
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
@@ -941,7 +938,6 @@ class EngineArgs:
         )
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
-        parallel_group.add_argument("--cloud-addr", **parallel_kwargs["cloud_addr"])
         parallel_group.add_argument("--nnodes", "-n", **parallel_kwargs["nnodes"])
         parallel_group.add_argument("--node-rank", "-r", **parallel_kwargs["node_rank"])
         parallel_group.add_argument(
@@ -1055,9 +1051,6 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--enable-edge-cloud", **parallel_kwargs["enable_edge_cloud"]
-        )
-        parallel_group.add_argument(
-            "--enable-pd-separation", **parallel_kwargs["enable_pd_separation"]
         )
         parallel_group.add_argument(
             "--edge-npu-count", **parallel_kwargs["edge_npu_count"]
@@ -1403,10 +1396,6 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--pd-scheduling-policy", **scheduler_kwargs["pd_scheduling_policy"]
-        )
-        scheduler_group.add_argument(
-            "--pd-prefill-inflight-limit",
-            **scheduler_kwargs["pd_prefill_inflight_limit"],
         )
 
         # Compilation arguments
@@ -1933,7 +1922,6 @@ class EngineArgs:
             data_parallel_size_local=data_parallel_size_local,
             master_addr=self.master_addr,
             master_port=self.master_port,
-            cloud_addr=self.cloud_addr,
             nnodes=self.nnodes,
             node_rank=self.node_rank,
             distributed_timeout_seconds=self.distributed_timeout_seconds,
@@ -1947,7 +1935,6 @@ class EngineArgs:
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
             enable_edge_cloud=self.enable_edge_cloud,
-            enable_pd_separation=self.enable_pd_separation,
             edge_npu_count=self.edge_npu_count,
             cloud_npu_count=self.cloud_npu_count,
             is_edge_node=not headless if self.enable_edge_cloud else False,
@@ -2017,9 +2004,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
-            enable_pd_separation=self.enable_pd_separation,
             pd_scheduling_policy=self.pd_scheduling_policy,
-            pd_prefill_inflight_limit=self.pd_prefill_inflight_limit,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
