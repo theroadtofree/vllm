@@ -103,6 +103,11 @@ _PD_LAST_TYPES = frozenset({
     BatchType.PREFILL_LAST,
     BatchType.DECODE_LAST,
 })
+# Speculative draft types. The edge-cloud draft path is only
+# supported for non-MOE models; raising otherwise lets the caller
+# fail fast instead of silently producing wrong outputs.
+_DRAFT_FIRST_TYPE = BatchType.DRAFT_FIRST
+_DRAFT_LAST_TYPE = BatchType.DRAFT_LAST
 
 
 # ---------------------------------------------------------------------------
@@ -653,8 +658,34 @@ class SharedModelWorkerProc:
                 so = args[0] if args else None
                 bt = getattr(so, "batch_type", None)
 
+                # Speculative draft: only supported for non-MOE models.
+                # Call _execute_model_edge_draft_head/tail directly on
+                # the worker; these return a synchronous ModelRunnerOutput
+                # (no marker / async send-recv closure).
+                if bt == _DRAFT_FIRST_TYPE:
+                    if self.is_moe:
+                        raise RuntimeError(
+                            "DRAFT_FIRST batch_type is not supported for "
+                            "MOE models in the shared edge executor.")
+                    logger.info(
+                        "[PD] _dispatch: dp_rank=%d batch_type=%s → "
+                        "_execute_model_edge_draft_head",
+                        dp_rank, bt)
+                    output = virtual_worker._execute_model_edge_draft_head(so)
+
+                elif bt == _DRAFT_LAST_TYPE:
+                    if self.is_moe:
+                        raise RuntimeError(
+                            "DRAFT_LAST batch_type is not supported for "
+                            "MOE models in the shared edge executor.")
+                    logger.info(
+                        "[PD] _dispatch: dp_rank=%d batch_type=%s → "
+                        "_execute_model_edge_draft_tail",
+                        dp_rank, bt)
+                    output = virtual_worker._execute_model_edge_draft_tail(so)
+
                 # PD 分离: FIRST — head forward + isend
-                if bt in _PD_FIRST_TYPES and hasattr(
+                elif bt in _PD_FIRST_TYPES and hasattr(
                         virtual_worker, "execute_model_head_pre"):
                     logger.info(
                         "[PD] _dispatch: dp_rank=%d batch_type=%s → "
