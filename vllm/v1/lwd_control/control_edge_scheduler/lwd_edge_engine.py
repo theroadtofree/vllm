@@ -167,6 +167,21 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     )
                 # 载荷留存供构造线程互校(调度三元组,见 _lwd_cross_check_hello)
                 self._lwd_peer_hello = msg
+                # 数据面(AF_SMC)端点互校:建连以本地配置为准(与云 worker
+                # 读同一配置源),通告值不一致仅告警——部署错位可观测
+                if msg.data_plane_port_base:
+                    local = LwdConfig.from_env_and_config(self.vllm_config)
+                    if (msg.data_plane_host, msg.data_plane_port_base) != (
+                        local.lwd_data_plane_host(),
+                        local.data_plane_port_base,
+                    ):
+                        logger.warning(
+                            "[Lwd] data-plane endpoint mismatch: "
+                            "hello=%s:%d local=%s:%d (建连以 local 为准)",
+                            msg.data_plane_host, msg.data_plane_port_base,
+                            local.lwd_data_plane_host(),
+                            local.data_plane_port_base,
+                        )
                 while not publisher.retarget(endpoint):
                     if receiver.closed:
                         break

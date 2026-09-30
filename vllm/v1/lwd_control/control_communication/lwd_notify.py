@@ -93,6 +93,13 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     max_num_batched_tokens: int = 0
     max_num_seqs: int = 0
     num_speculative_tokens: int = 0
+    data_plane_host: str = ""
+    """数据面(AF_SMC)端点通告:云侧 bind 的 host。边侧与本地装配配置
+    比对,不一致仅告警——建连以本地配置为准(静态轨建连、HELLO 动态
+    轨校验的双轨设计,同 pre_out 的既有模式)。缺省 "" = 旧版云侧
+    未携带(msgspec 带默认字段,线上 additive 兼容)。"""
+    data_plane_port_base: int = 0
+    """数据面端口基址:UP=base, DOWN=base+1;0 = 未携带。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值

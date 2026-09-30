@@ -107,6 +107,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             num_speculative_tokens=(
                 getattr(spec_config, "num_speculative_tokens", None) or 0
             ),
+            # 数据面(AF_SMC)端点通告:云 worker 按同一配置源 bind,
+            # 边侧与本地配置比对(不一致仅告警,建连以本地为准)
+            data_plane_host=config.lwd_data_plane_host(),
+            data_plane_port_base=config.data_plane_port_base,
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()

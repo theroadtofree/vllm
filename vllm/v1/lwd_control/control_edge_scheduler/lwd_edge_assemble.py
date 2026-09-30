@@ -28,6 +28,10 @@ logger = init_logger(__name__)
 
 LWD_PRE_OUT_PORT_DEFAULT = 5558
 LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
+# 数据面(AF_SMC)端口基址:UP=base, DOWN=base+1;与 vllm_ascend 的
+# smc_wire._DATA_PLANE_PORT_DEFAULT 保持一致(两处各自定义,避免
+# vllm_ascend 对装配层的反向 import)
+LWD_DATA_PLANE_PORT_DEFAULT = LWD_POST_OUT_PORT_DEFAULT + 1
 # 等云首拍 HELLO 的预算:HELLO 在云引擎全量初始化(权重/KV/图编译
 # capture)完成后才发出,预算须覆盖云的全量启动时长(边不开图、
 # 云开图是本场景固定形态),默认 600s;部署可经 hello_timeout_s/env 覆盖
@@ -52,10 +56,22 @@ class LwdConfig:
     scheduler_name: str = "mixed"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     debug: bool = False
+    data_plane_host: str = ""
+    """数据面(AF_SMC)地址:云侧 bind / 边侧 connect 的 RoCE 网段 IP。
+    缺省随 pre_out_host(同一网段);云侧通告值(HELLO)与建连值都取
+    本字段经 lwd_data_plane_host() 的解析结果。"""
+    data_plane_port_base: int = LWD_DATA_PLANE_PORT_DEFAULT
+    """数据面端口基址:UP=base, DOWN=base+1。"""
+    data_plane_family: str = "smc"
+    """数据面 socket 族:"smc"(AF_SMC/RDMA)或 "tcp"(排障对照)。"""
 
     def lwd_pre_out_endpoint(self) -> str:
         """PRE_OUT 端点:云侧 bind 地址,随 HELLO 通告给边。"""
         return f"tcp://{self.pre_out_host}:{self.pre_out_port}"
+
+    def lwd_data_plane_host(self) -> str:
+        """数据面地址解析:缺省随 pre_out_host(同一 RoCE 网段)。"""
+        return self.data_plane_host or self.pre_out_host
 
     def lwd_post_out_bind_endpoint(self) -> str:
         """POST_OUT 端点:边侧 bind,云经 master_addr 来连。"""
@@ -83,6 +99,11 @@ class LwdConfig:
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
             ),
             debug=bool(section.get("debug", False)),
+            data_plane_host=str(section.get("data_plane_host", "")),
+            data_plane_port_base=int(
+                section.get("data_plane_port_base", LWD_DATA_PLANE_PORT_DEFAULT)
+            ),
+            data_plane_family=str(section.get("data_plane_family", "smc")),
         )
         return _lwd_apply_env_overrides(config)
 
@@ -118,6 +139,9 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
     post_bind = os.getenv(_LWD_ENV_PREFIX + "POST_OUT_BIND")
     hello_timeout = _lwd_read_env_float("HELLO_TIMEOUT_S")
     debug = os.getenv(_LWD_ENV_PREFIX + "DEBUG")
+    dp_host = os.getenv(_LWD_ENV_PREFIX + "DATA_PLANE_HOST")
+    dp_port = _lwd_read_env_int("DATA_PLANE_PORT")
+    dp_family = os.getenv(_LWD_ENV_PREFIX + "DATA_PLANE_FAMILY")
     return LwdConfig(
         is_edge_node=config.is_edge_node,
         pre_out_host=host if host else config.pre_out_host,
@@ -130,6 +154,13 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         scheduler_name=config.scheduler_name,
         publish_queue_max=config.publish_queue_max,
         debug=config.debug or (debug is not None and debug.lower() == "1"),
+        data_plane_host=dp_host if dp_host else config.data_plane_host,
+        data_plane_port_base=(
+            dp_port if dp_port is not None else config.data_plane_port_base
+        ),
+        data_plane_family=(
+            dp_family if dp_family else config.data_plane_family
+        ),
     )
 
 
