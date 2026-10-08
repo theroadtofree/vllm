@@ -22,15 +22,60 @@ SMC/TCP 都是字节流:顺序天然保证,帧头 seqno 只做防御性校验
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import os
 import socket
 import struct
 import time
 
 # linux/uapi linux/socket.h: AF_SMC = 43(PF_SMC 同值);
-# linux/uapi linux/in.h: IPPROTO_SMC = 265。
-# 较新的 Python 3 自带这两个常量,老版本用数值兜底。
+# SMCPROTO_SMC = 0(Linux 内核 SMC 协议默认值;IPPROTO_SMC=265 是
+# 另一个协议号,某些内核未注册时会 Errno 93,统一用 0 兜底)。
 AF_SMC = getattr(socket, "AF_SMC", 43)
-IPPROTO_SMC = getattr(socket, "IPPROTO_SMC", 265)
+IPPROTO_SMC = getattr(socket, "IPPROTO_SMC", 265)  # 保留供参考,open_socket 不用
+
+# Python socket 模块的 bind/connect 只会打包 AF_INET/AF_INET6/AF_UNIX
+# 三种地址族,对 AF_SMC=43 走 default 分支抛 "bad family"(根本到不了
+# 内核)。但内核 net/smc/af_smc.c 的 smc_bind/smc_connect 实际接受
+# sockaddr_in(sa_family=AF_INET)与 sockaddr_in6。所以 AF_SMC socket
+# 的 bind/connect 必须绕过 Python,直接调 libc,把 sockaddr_in 喂给内核。
+# 用 try/except 包加载:非 Linux 上 import 本模块不会炸,实际调用时再报错。
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    _libc.bind.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    _libc.bind.restype = ctypes.c_int
+    _libc.connect.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    _libc.connect.restype = ctypes.c_int
+except OSError:
+    _libc = None  # 非 Linux 平台;AF_SMC 本就只支持 Linux,这里只是不阻断 import
+
+
+def _pack_sockaddr_in(host: str, port: int) -> bytes:
+    """struct sockaddr_in(16 字节):
+        sa_family_t sin_family;   // uint16,native 字节序
+        in_port_t   sin_port;     // uint16,网络序
+        struct in_addr sin_addr; // uint32,网络序
+        char        sin_zero[8];  // padding
+    仅 IPv4;IPv6 待后续按需扩展(sockaddr_in6,28 字节)。
+
+    字节序:sa_family 是 native(宿主)序,用 '='(native,无 padding);
+    sin_port/sin_addr 是网络序,用 htons/inet_aton 转好后再按 native
+    写出(x86 上 htons(port) 的字节落地就是网络序,等价 '<H',但
+    big-endian 架构上 '<H' 会错,'=H' 跨架构都对)。"""
+    return struct.pack(
+        "=H H 4s 8s",
+        socket.AF_INET,
+        socket.htons(port),
+        socket.inet_aton(host),
+        b"\x00" * 8,
+    )
+
+
+def _raise_errno(err: int, call: str, host: str, port: int) -> None:
+    # EINPROGRESS 在非阻塞 connect 是正常返回;本 demo 用阻塞 socket,
+    # 不期望出现,但保险起见透传。
+    raise OSError(err, os.strerror(err), (host, port)) from None
 
 HEADER = struct.Struct("!4sQQQ")  # magic, seqno, payload_len, aux_len
 MAGIC = b"LWD1"
@@ -49,6 +94,34 @@ def open_socket(family: str) -> socket.socket:
     else:
         raise ValueError(f"unknown family: {family!r} (expect 'smc' or 'tcp')")
     return sock
+
+
+def bind_socket(sock: socket.socket, family: str, host: str, port: int) -> None:
+    """统一 bind 入口:AF_SMC 走 libc 直传 sockaddr_in(Python 不认 AF_SMC
+    地址);TCP 走原生 socket.bind。host 必须是 IPv4 字符串。"""
+    if family == "smc":
+        if _libc is None:
+            raise RuntimeError("AF_SMC 需要 libc;非 Linux 平台无法 bind")
+        addr = _pack_sockaddr_in(host, port)
+        fd = sock.fileno()
+        if _libc.bind(fd, addr, len(addr)) < 0:
+            _raise_errno(ctypes.get_errno(), "bind", host, port)
+    else:
+        sock.bind((host, port))
+
+
+def connect_socket(sock: socket.socket, family: str, host: str, port: int) -> None:
+    """统一 connect 入口:AF_SMC 走 libc 直传 sockaddr_in;TCP 走原生。
+    阻塞 socket,connect 返回即建连完成(SMC 含 CLC 协商 + RDMA 链路建立)。"""
+    if family == "smc":
+        if _libc is None:
+            raise RuntimeError("AF_SMC 需要 libc;非 Linux 平台无法 connect")
+        addr = _pack_sockaddr_in(host, port)
+        fd = sock.fileno()
+        if _libc.connect(fd, addr, len(addr)) < 0:
+            _raise_errno(ctypes.get_errno(), "connect", host, port)
+    else:
+        sock.connect((host, port))
 
 
 def send_frame(sock: socket.socket, seqno: int, payload: bytes, aux: bytes = b"") -> None:

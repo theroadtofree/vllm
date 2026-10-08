@@ -30,6 +30,7 @@ import zlib
 
 from smc_common import (
     FrameStats,
+    connect_socket,
     now,
     open_socket,
     print_smc_state,
@@ -67,7 +68,9 @@ def main() -> int:
 
     sock = open_socket(args.family)
     t0 = now()
-    sock.connect((args.host, args.port))
+    # AF_SMC socket 的 connect 不能走 Python socket.connect(同 bind:
+    # Python 不认 AF_SMC 地址族),改走 smc_common.connect_socket。
+    connect_socket(sock, args.family, args.host, args.port)
     connect_ms = (now() - t0) * 1000
     # SMC 建连含 TCP 握手 + CLC 协商 + RDMA 链路建立,
     # 比 TCP 握手慢是正常现象(等价于 HCCL 方案的建组/预热成本)。

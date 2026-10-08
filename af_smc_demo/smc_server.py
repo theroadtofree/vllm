@@ -21,6 +21,7 @@ import zlib
 
 from smc_common import (
     FrameStats,
+    bind_socket,
     now,
     open_socket,
     print_smc_state,
@@ -40,7 +41,9 @@ def main() -> int:
 
     srv = open_socket(args.family)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.host, args.port))
+    # AF_SMC socket 的 bind 不能走 Python socket.bind(Python 不认 AF_SMC
+    # 地址族,会抛 "bad family"),改走 smc_common.bind_socket 直接调 libc。
+    bind_socket(srv, args.family, args.host, args.port)
     srv.listen(1)
     print(f"[cloud] family={args.family} listening on {args.host}:{args.port}, "
           f"expecting {args.frames} frames")
