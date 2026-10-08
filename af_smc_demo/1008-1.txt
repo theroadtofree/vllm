@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/vllm-workspace/vllm/af_smc_demo/smc_server.py", line 82, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/vllm-workspace/vllm/af_smc_demo/smc_server.py", line 41, in main
+    srv = open_socket(args.family)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/af_smc_demo/smc_common.py", line 43, in open_socket
+    sock = socket.socket(AF_SMC, socket.SOCK_STREAM, IPPROTO_SMC)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.15/lib/python3.11/socket.py", line 232, in __init__
+    _socket.socket.__init__(self, family, type, proto, fileno)
+OSError: [Errno 93] Protocol not supported
