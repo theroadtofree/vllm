@@ -88,15 +88,32 @@ MAGIC = b"LWD1"
 HEADER_SIZE = HEADER.size  # 28
 
 
+# SMC-R 的 RMBE 尺寸按 SO_SNDBUF/SO_RCVBUF 协商:默认 socket buffer
+# (~208KB)会让 RMBE 取最小档,4MB 大帧被切成十几个小块、逐块等对端
+# CDC 确认才能复用空间,ping-pong 拖垮吞吐(实测 SMC-R 反而比 TCP 慢)。
+# 两端宿主需同步调大内核上限,否则 setsockopt 会被静默截断:
+#   sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+# TCP 对照组同样设置,保证对比公平(默认小 buffer 下 TCP 也吃亏)。
+BUF_MB = 8
+
+
+def _set_big_buffers(sock: socket.socket, mb: int = BUF_MB) -> None:
+    nbytes = mb * 1024 * 1024
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, nbytes)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, nbytes)
+
+
 def open_socket(family: str) -> socket.socket:
     """按 family 建流式 socket:smc = AF_SMC(RDMA 数据面),tcp = 对照组。"""
     if family == "smc":
         sock = socket.socket(AF_SMC, socket.SOCK_STREAM, 0)
+        _set_big_buffers(sock)
     elif family == "tcp":
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         # TCP 对照组关 Nagle 以公平对比帧延迟;SMC 数据面走 RDMA WRITE,
         # 无 Nagle 概念,保持默认。
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _set_big_buffers(sock)
     else:
         raise ValueError(f"unknown family: {family!r} (expect 'smc' or 'tcp')")
     return sock
