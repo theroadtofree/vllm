@@ -21,6 +21,7 @@ import zlib
 
 from smc_common import (
     FrameStats,
+    accept_socket,
     bind_socket,
     now,
     open_socket,
@@ -48,7 +49,9 @@ def main() -> int:
     print(f"[cloud] family={args.family} listening on {args.host}:{args.port}, "
           f"expecting {args.frames} frames")
 
-    conn, peer = srv.accept()
+    # AF_SMC socket 的 accept 同样要走 smc_common.accept_socket(Python
+    # socket.accept 内部 getsockaddrlen 不认 AF_SMC)。
+    conn, peer = accept_socket(srv, args.family)
     print(f"[cloud] accepted from {peer}")
 
     stats = FrameStats()

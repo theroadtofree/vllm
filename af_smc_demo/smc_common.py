@@ -47,6 +47,12 @@ try:
     _libc.bind.restype = ctypes.c_int
     _libc.connect.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     _libc.connect.restype = ctypes.c_int
+    _libc.accept.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    _libc.accept.restype = ctypes.c_int
 except OSError:
     _libc = None  # 非 Linux 平台;AF_SMC 本就只支持 Linux,这里只是不阻断 import
 
@@ -72,10 +78,10 @@ def _pack_sockaddr_in(host: str, port: int) -> bytes:
     )
 
 
-def _raise_errno(err: int, call: str, host: str, port: int) -> None:
+def _raise_errno(err: int, call: str, addr: tuple = ()) -> None:
     # EINPROGRESS 在非阻塞 connect 是正常返回;本 demo 用阻塞 socket,
     # 不期望出现,但保险起见透传。
-    raise OSError(err, os.strerror(err), (host, port)) from None
+    raise OSError(err, f"{call}: {os.strerror(err)}", addr) from None
 
 HEADER = struct.Struct("!4sQQQ")  # magic, seqno, payload_len, aux_len
 MAGIC = b"LWD1"
@@ -105,7 +111,7 @@ def bind_socket(sock: socket.socket, family: str, host: str, port: int) -> None:
         addr = _pack_sockaddr_in(host, port)
         fd = sock.fileno()
         if _libc.bind(fd, addr, len(addr)) < 0:
-            _raise_errno(ctypes.get_errno(), "bind", host, port)
+            _raise_errno(ctypes.get_errno(), "bind", (host, port))
     else:
         sock.bind((host, port))
 
@@ -119,9 +125,48 @@ def connect_socket(sock: socket.socket, family: str, host: str, port: int) -> No
         addr = _pack_sockaddr_in(host, port)
         fd = sock.fileno()
         if _libc.connect(fd, addr, len(addr)) < 0:
-            _raise_errno(ctypes.get_errno(), "connect", host, port)
+            _raise_errno(ctypes.get_errno(), "connect", (host, port))
     else:
         sock.connect((host, port))
+
+
+def _parse_sockaddr_in(buf: bytes) -> tuple:
+    """从 sockaddr_in 字节解 (host, port);长度不足或非 AF_INET 返回占位。
+    内核 SMC 的 getname 对外暴露 sockaddr_in(sa_family=AF_INET),
+    port/addr 字段都是网络序。"""
+    if len(buf) < 8:
+        return ("?", 0)
+    sa_family = int.from_bytes(buf[0:2], "little")  # native LE(x86) 足够
+    if sa_family != socket.AF_INET:
+        return (f"<family {sa_family}>", 0)
+    port = struct.unpack("!H", buf[2:4])[0]
+    host = socket.inet_ntoa(buf[4:8])
+    return (host, port)
+
+
+def accept_socket(srv: socket.socket, family: str) -> tuple[socket.socket, tuple]:
+    """统一 accept 入口:AF_SMC 走 libc accept(Python socket.accept 内部
+    先 getsockaddrlen 决定 peer 缓冲区长度,对 AF_SMC 抛 "bad family"),
+    再用 socket.socket(fileno=) 把 fd 包回 Python socket 对象。TCP 走原生。
+
+    返回 (conn, peer) 与原生 accept 一致;peer 为 (host, port)。
+    AF_SMC socket 的 recv/send 不感知地址族,后续读写不受影响。"""
+    if family == "smc":
+        if _libc is None:
+            raise RuntimeError("AF_SMC 需要 libc;非 Linux 平台无法 accept")
+        # 128 字节足以容纳 sockaddr_in(16)/sockaddr_in6(28)/sockaddr_un(110)
+        addrbuf = ctypes.create_string_buffer(128)
+        addrlen = ctypes.c_uint(128)
+        new_fd = _libc.accept(srv.fileno(), addrbuf, ctypes.byref(addrlen))
+        if new_fd < 0:
+            _raise_errno(ctypes.get_errno(), "accept")
+        # socket.socket(fileno=...) 不调 socket() syscall,只是收养 fd;
+        # 仍按 AF_SMC 标注 family,后续 getpeername 会再炸,但 demo 用不到。
+        conn = socket.socket(AF_SMC, socket.SOCK_STREAM, 0, fileno=new_fd)
+        peer = _parse_sockaddr_in(addrbuf.raw[: addrlen.value])
+        return conn, peer
+    else:
+        return srv.accept()
 
 
 def send_frame(sock: socket.socket, seqno: int, payload: bytes, aux: bytes = b"") -> None:
