@@ -40,7 +40,7 @@ HEADER_SIZE = HEADER.size  # 28
 def open_socket(family: str) -> socket.socket:
     """按 family 建流式 socket:smc = AF_SMC(RDMA 数据面),tcp = 对照组。"""
     if family == "smc":
-        sock = socket.socket(AF_SMC, socket.SOCK_STREAM, IPPROTO_SMC)
+        sock = socket.socket(AF_SMC, socket.SOCK_STREAM, 0)
     elif family == "tcp":
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         # TCP 对照组关 Nagle 以公平对比帧延迟;SMC 数据面走 RDMA WRITE,
