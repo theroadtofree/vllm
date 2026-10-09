@@ -318,9 +318,10 @@ class WorkerWrapperBase:
             self.vllm_config is not None
             and self.vllm_config.parallel_config.lwd_config.enable_lwd
         ):
-            # LWD edge-cloud: each side's engine only collects its LOCAL
-            # workers' configs, so index by local (rpc) rank instead of the
-            # global rank (cloud global ranks start at edge_npu_count).
+            # LWD edge-cloud (split worlds): each side's engine only
+            # collects its LOCAL workers' configs, so index by the local
+            # (rpc) rank — with each side numbering workers from 0 this
+            # also equals the global rank, keeping the indexing explicit.
             index = self.rpc_rank
         kv_cache_config = kv_cache_configs[index]
         assert self.vllm_config is not None

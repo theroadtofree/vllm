@@ -169,11 +169,11 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.lwd_config.enable_lwd:
-                global_start_rank = (
-                    0
-                    if self.parallel_config.lwd_config.is_edge_node
-                    else self.parallel_config.lwd_config.edge_npu_count
-                )
+                # 拆 world:边、云各自独立分布式环境,worker rank 在
+                # 本实例内从 0 起编号(不再有跨实例的 edge-first 全局
+                # 偏移);与 init_distributed_environment 的
+                # ranks=[0, world_size) 对齐。
+                global_start_rank = 0
             else:
                 global_start_rank = (
                     self.local_world_size * self.parallel_config.node_rank_within_dp
@@ -287,12 +287,11 @@ class MultiprocExecutor(Executor):
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.lwd_config.enable_lwd:
-            # Each side's first rank is its own engine's driver worker
-            # (edge rank 0, cloud rank edge_npu_count); the native
-            # ``rank % tp_size`` picks the wrong worker under the
-            # edge-first asymmetric layout.
-            lwd = self.parallel_config.lwd_config
-            return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
+            # Each side's rank 0 is its own engine's driver worker
+            # (split worlds: both sides number their workers from 0);
+            # the native ``rank % tp_size`` picks the wrong worker under
+            # the asymmetric edge/cloud layout.
+            return rank == 0
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
@@ -574,9 +573,10 @@ class UnreadyWorkerProcHandle:
     rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
-    # Node-local index. Under LWD edge-cloud, cloud workers' global ranks
-    # are offset by edge_npu_count, so READY-slot placement by
-    # ``rank % len`` swaps workers there — place by this index instead.
+    # Node-local index. Under LWD edge-cloud (split worlds), each side
+    # numbers its workers from 0, but placing READY handles by the
+    # node-local index stays robust regardless of the rank numbering
+    # scheme — keep it explicit.
     local_rank: int | None = None
 
 
@@ -629,7 +629,7 @@ class WorkerProc:
                 or vllm_config.parallel_config.lwd_config.enable_lwd):
             # Initialize MessageQueue for receiving SchedulerOutput.
             # ``local_rank`` is the reader slot in the engine's queue
-            # (cloud global ranks are offset by edge_npu_count).
+            # (LWD split worlds: each side numbers workers from 0).
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
                 input_shm_handle, self.local_rank
             )
@@ -832,10 +832,11 @@ class WorkerProc:
                     if response["status"] != "READY":
                         raise e
 
-                    # Cloud workers' global ranks are offset by
-                    # edge_npu_count: ``rank % len`` swaps their slots and
-                    # the executor then reads the WRONG worker's response
-                    # queue — place each handle by its node-local index.
+                    # Place each READY handle by its node-local index —
+                    # robust against any rank-numbering scheme (LWD
+                    # split worlds number workers from 0, so ``rank %
+                    # len`` happens to match; local placement keeps it
+                    # correct by construction).
                     _local_rank = unready_proc_handle.local_rank
                     idx = (
                         _local_rank
@@ -1082,10 +1083,9 @@ class WorkerProc:
 
     def _owns_rpc_reply(self, output_rank: int | None) -> bool:
         # output_rank is an INSTANCE-LOCAL driver index (_get_output_rank
-        # returns 0 for LWD), while cloud workers' global ranks are offset
-        # by edge_npu_count — without the local-rank fallback no cloud
-        # worker would ever claim the reply and the engine would block on
-        # future.result() until the RPC timeout.
+        # returns 0 for LWD). Under split worlds both sides number their
+        # workers from 0, so the rank comparison matches directly; the
+        # local-rank fallback covers the shared-edge DP corner case.
         if output_rank is None or self.rank == output_rank:
             return True
         return self._reply_by_local_rank and self.local_rank == output_rank
