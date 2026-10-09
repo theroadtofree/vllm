@@ -1746,40 +1746,38 @@ def initialize_model_parallel(
     parallel_config = config.parallel_config
     coord_store: Store | None = None
 
-    # Lwd 边云模式:边云 rank 数不对称(edge_npu_count + cloud_npu_count),
-    # 排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后返回。
-    # 布局(以边 1 + 云 4、dp=1、world=5 为例):
-    #   TP: [[0], [1,2,3,4]]        边单例;云 4 卡合切一份权重
-    #   PP: [[0,1], [2], [3], [4]]  边 rank0 与云 rank1 组成两段流水线,
-    #                               其余云 rank 单例
-    #   DCP/PCP/DP: 全单例
-    #   EP(仅 MoE): [[0], [1,2,3,4]]
-    # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
+    # Lwd 边云模式(拆 world 形态):边、云各自独立 world(HCCL 通信域
+    # 只在本实例内),不再有跨机集合通信;跨机只剩控制面 ZMQ 与数据面
+    # AF_SMC(见 vllm_ascend smc_wire)。实例身份锚点是 lwd_config 的
+    # role 镜像 is_edge_node。本实例视角分组(以边 E 卡、云 C 卡、
+    # dp=1 为例):
+    #   边实例(world=E):TP [[0..E-1]];PP/DCP/PCP 全单例;DP/EP 全组
+    #   云实例(world=C):TP [[0..C-1]];PP/DCP/PCP 全单例;DP/EP 全组
+    # PP 恒单例:原跨机 PP 对(边 rank0 与云 rank0 两段流水线)随全局
+    # 通信域一并拆除;first/last 语义由 _LWD_FULL_HEAD_TAIL 中性化
+    # (两侧皆 first/last),消费方 is_first_rank 不受影响。
     if parallel_config.lwd_config.enable_lwd:
         global _TP, _PP, _DCP, _PCP, _DP, _EP
         assert not enable_elastic_ep, (
             "elastic EP is not supported in Lwd edge-cloud mode")
         lwd = parallel_config.lwd_config
-        world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )
-        edge_count = lwd.edge_npu_count
-        cloud_count = lwd.cloud_npu_count
-        world_per_dp = edge_count + cloud_count
-        assert world_size == data_parallel_size * world_per_dp, (
+        is_edge = lwd.is_edge_node
+        side_count = lwd.edge_npu_count if is_edge else lwd.cloud_npu_count
+        assert data_parallel_size == 1, (
+            "Lwd edge-cloud runs two separate worlds (edge and cloud); "
+            "cross-instance data parallel is not expressible")
+        assert world_size == side_count, (
             f"Lwd world size mismatch: got {world_size}, expected "
-            f"{data_parallel_size} * ({edge_count} + {cloud_count})")
-        is_edge = rank % world_per_dp < edge_count
+            f"{'edge' if is_edge else 'cloud'} npu count {side_count}")
 
-        # TP:每个 dp 实例内,边 rank 一组、云 rank 一组
+        # TP:本实例全卡一组(边 E 卡;云 C 卡合切一份权重)
         assert _TP is None, "tensor model parallel group is already initialized"
-        tp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            tp_groups.append([base + r for r in range(edge_count)])
-            tp_groups.append([base + edge_count + r for r in range(cloud_count)])
+        tp_groups: list[list[int]] = [list(range(world_size))]
         _TP = init_model_parallel_group(
             tp_groups,
             get_world_group().local_rank,
@@ -1788,15 +1786,9 @@ def initialize_model_parallel(
             group_name="tp",
         )
 
-        # PP:每实例边 rank0 与云 rank0 成两段 pp 对,其余 rank 单例
+        # PP:全单例(跨机流水线已随全局通信域拆除)
         assert _PP is None, "pipeline model parallel group is already initialized"
-        pp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            pp_groups.append([base + 0, base + edge_count])
-            for r in range(1, world_per_dp):
-                if r != edge_count:
-                    pp_groups.append([base + r])
+        pp_groups: list[list[int]] = [[r] for r in range(world_size)]
         _PP = init_model_parallel_group(
             pp_groups,
             get_world_group().local_rank,
@@ -1809,8 +1801,9 @@ def initialize_model_parallel(
         _LWD_FULL_HEAD_TAIL = True
 
         # DCP/PCP:全单例(pcp_size = dcp_size = 1)
-        singleton_groups = [[r] for r in range(world_size)]
-        assert _DCP is None, "decode context model parallel group is already initialized"
+        singleton_groups = pp_groups
+        assert _DCP is None, (
+            "decode context model parallel group is already initialized")
         _DCP = init_model_parallel_group(
             singleton_groups,
             get_world_group().local_rank,
@@ -1818,49 +1811,42 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=True,
             group_name="dcp",
         )
-        assert _PCP is None, "prefill context parallel group is already initialized"
+        assert _PCP is None, (
+            "prefill context model parallel group is already initialized")
         _PCP = init_model_parallel_group(
             singleton_groups,
             get_world_group().local_rank,
             backend,
+            use_message_queue_broadcaster=True,
             group_name="pcp",
         )
 
-        # DP:各 dp 实例同位置的 rank 一组
+        # DP:dp=1,一组含本实例全部 rank(与原生 dp=1 语义一致)
         assert _DP is None, "data parallel group is already initialized"
-        dp_groups = [
-            [pos + dp_idx * world_per_dp for dp_idx in range(data_parallel_size)]
-            for pos in range(world_per_dp)
-        ]
+        dp_groups: list[list[int]] = [list(range(world_size))]
         _DP = init_model_parallel_group(
             dp_groups, get_world_group().local_rank, backend, group_name="dp"
         )
 
-        # EP(仅 MoE):边 rank 一组、云 rank 一组
+        # EP(仅 MoE):本实例全卡一组
         if config.model_config is not None and config.model_config.is_moe:
             assert _EP is None, "expert parallel group is already initialized"
-            ep_edge_ranks: list[int] = []
-            ep_cloud_ranks: list[int] = []
-            for dp_idx in range(data_parallel_size):
-                base = dp_idx * world_per_dp
-                ep_edge_ranks.extend(range(base, base + edge_count))
-                ep_cloud_ranks.extend(range(base + edge_count, base + world_per_dp))
             _EP = init_model_parallel_group(
-                [ep_edge_ranks, ep_cloud_ranks],
+                [list(range(world_size))],
                 get_world_group().local_rank,
                 backend,
                 group_name="ep",
             )
 
         logger.info(
-            "Lwd edge-cloud mode initialized: rank %s, is_edge=%s, "
-            "edge_npu_count=%s, cloud_npu_count=%s, world_size=%s, "
+            "Lwd edge-cloud mode initialized (split worlds): rank %s, "
+            "is_edge=%s, side_world=%s (topology edge=%s + cloud=%s), "
             "TP groups=%s, PP groups=%s, DP groups=%s",
             rank,
             is_edge,
-            edge_count,
-            cloud_count,
             world_size,
+            lwd.edge_npu_count,
+            lwd.cloud_npu_count,
             tp_groups,
             pp_groups,
             dp_groups,

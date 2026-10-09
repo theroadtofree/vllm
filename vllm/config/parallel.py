@@ -830,19 +830,11 @@ class ParallelConfig:
             * self.prefill_context_parallel_size
         )
 
-        # LWD edge-cloud mode: ``world_size`` spans both sides of the
-        # deployment (per DP instance) so that per-rank bookkeeping (e.g.
-        # ``WorkerProc.all_kwargs``) has a slot for every edge/cloud rank.
-        # NOTE: ``lwd_config.enable_lwd`` is only back-filled later in
-        # ``VllmConfig.__post_init__``, so gate on the CLI-provided NPU
-        # counts here instead.
-        if (
-            self.lwd_config.edge_npu_count > 0
-            and self.lwd_config.cloud_npu_count > 0
-        ):
-            self.world_size = (
-                self.lwd_config.edge_npu_count + self.lwd_config.cloud_npu_count
-            )
+        # LWD edge-cloud mode: no world_size override here. The split-world
+        # form (edge and cloud run separate distributed environments) sets
+        # world_size to THIS side's NPU count in ``VllmConfig.__post_init__``
+        # (where the role mirror is available); constructing-time defaults
+        # are superseded before any executor/bookkeeping consumes them.
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")

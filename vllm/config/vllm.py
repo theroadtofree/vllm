@@ -867,18 +867,17 @@ class VllmConfig:
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
-            # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
-            # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
-            # KV spec/MoE 切分等配置派生量与运行时组态对齐。
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if self.lwd_config.is_edge
-                else parallel_lwd.cloud_npu_count
-            )
-            # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
-            # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
-            # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
-            # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
+            if (not self.lwd_config.is_edge
+                    and parallel_lwd.cloud_npu_count <= 0):
+                raise ValueError(
+                    "--cloud-npu-count must be positive on the LWD cloud "
+                    "process")
+            # 拆 world:边、云各自独立分布式环境(不再共享 rendezvous,
+            # 跨机只有控制面 ZMQ + 数据面 AF_SMC)。本实例视角:
+            #   world/TP = 本侧卡数(边 edge_npu_count、云 cloud_npu_count,
+            #   云侧按此切权重,头数/KV spec/MoE 切分等派生量与组态对齐);
+            #   PP 恒 1——原跨机 PP 对(边 rank0 与云 rank0)随全局通信域
+            #   一并拆除,分组见 parallel_state 的 LWD 分支。
             if (self.parallel_config.tensor_parallel_size != 1
                     or self.parallel_config.pipeline_parallel_size != 1):
                 logger.warning(
@@ -888,9 +887,11 @@ class VllmConfig:
                     self.parallel_config.pipeline_parallel_size,
                 )
             self.parallel_config.world_size = (
-                parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
+                parallel_lwd.edge_npu_count
+                if parallel_lwd.is_edge_node
+                else parallel_lwd.cloud_npu_count
             )
-            self.parallel_config.pipeline_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
             self.parallel_config.tensor_parallel_size = (
                 parallel_lwd.edge_npu_count
                 if parallel_lwd.is_edge_node
