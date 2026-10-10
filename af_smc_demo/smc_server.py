@@ -37,8 +37,13 @@ def main() -> int:
                     help="bind 地址;建议显式 bind 云侧 RoCE 网段 IP")
     ap.add_argument("--port", type=int, default=19901)
     ap.add_argument("--frames", type=int, default=100)
-    ap.add_argument("--family", choices=["smc", "tcp"], default="smc")
+    ap.add_argument("--family", choices=["smc", "tcp", "verbs"], default="smc")
     args = ap.parse_args()
+
+    if args.family == "verbs":
+        import verbs_demo
+
+        return verbs_demo.run_server(args)
 
     srv = open_socket(args.family)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

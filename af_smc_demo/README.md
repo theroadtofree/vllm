@@ -75,14 +75,74 @@ SMC 协商失败会**静默回退 TCP**,功能正常但拿不到 RDMA 收益。�
 - `sendall` 返回仅代表数据进入本地发送路径;端到端吞吐以边侧
   "首帧发出→ACK 收完"与云侧接收统计为准。
 
+## 吞吐低于 TCP 的排查(SMC-R 单流的三个限制器)
+
+实测参考:10G 链路,ib_write_bw 9.4-9.7Gbps,demo SMC 3.3Gbps(低 RTT 环境)/
+0.67Gbps(高 RTT 环境)。SMC-R 的吞吐模型与 TCP 本质不同:
+
+| | TCP | SMC-R |
+|---|---|---|
+| 窗口 | 运行时 autotuning,放开 rmem/wmem_max 新连接立刻受益 | 建连时 CLC 协商 RMBE 档位(定死),受协议编码上限约束 |
+| 数据推进 | 连续字节流 + TSO/GRO offload | 分块 RDMA WRITE + CDC credit 逐块确认 |
+
+排查顺序:
+
+1. **宿主 buffer 上限**(两端):demo 已 setsockopt 8MB,但内核会 clamp 到
+   `net.core.rmem_max/wmem_max`——默认 ~208KB 时 RMBE 取最小档:
+   `sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216`
+2. **autocorking**(两端,大块吞吐最直接的旋钮):SMC 发送端默认攒 64KB
+   (`net.smc.autocorking_size`)才推进一次 RDMA WRITE,4MiB 帧 = 64 块,
+   每块等 CDC 确认——吞吐 ≈ 块大小 / RTT,高 RTT 环境直接崩(实测 0.7ms
+   RTT 下 64×0.7ms/帧 ≈ 0.67Gbps,与实测吻合):
+   `sudo sysctl -w net.smc.autocorking_size=0`(禁用;或 1048576)
+3. **RTT**:`ping <对端_roce_ip>`——同一调优在低/高 RTT 环境效果差异巨大,
+   对比两环境数据时先对齐 RTT。
+4. **确认未 fallback**:`smcss` / `/proc/net/smc`;fallback 连接 = TCP +
+   SMC 层开销,特征恰好是"比纯 TCP 略低"。
+5. **口径校准**:看 server 行 recv-side goodput(client 的 end-to-end 含
+   DOWN ACK 回传,RTT 大时被惩罚)。
+
+调优后预期:低 RTT 环境 SMC 单流应显著超过 TCP、达到 ib_write_bw 的
+60-90%;高 RTT 环境 CDC 逐块确认的物理下限仍在——这是 SMC-R 协议模型
+(拷贝 + 分块 + 块确认)相对裸 verbs 的固有代价,若高 RTT 场景最终不达标,
+评估回到迁移方案文档里的 verbs 直写路线。
+
+## verbs 模式(--family verbs,拉远场景的预期路线)
+
+`verbs_demo.py` 提供 libibverbs(ctypes) RC SEND 传输,与正式实现
+`vllm_ascend/distributed/lwd_comm/verbs_wire.py` 同款模型(帧协议、
+握手消息格式、块池、RC SEND 双边),无 NPU 依赖,先在 demo 层验证
+verbs 数据面的连通与吞吐:
+
+```bash
+# 云侧(--port 即握手 TCP 端口)
+python3 smc_server.py --family verbs --host <云RoCE_IP> --port 19901
+# 边侧
+python3 smc_client.py --family verbs --host <云RoCE_IP> --port 19901
+```
+
+- 为什么:SMC-R 的 RMBE/RTT 窗口在拉远场景(实测 500km/5ms)上限
+  ~0.8Gbps(协议限制);verbs 无逐块确认模型,同链路 ib_send_bw
+  ~9.4Gbps。先跑 demo 对照 `ib_send_bw` 基线,再切正式实现
+  (`data_plane_family=verbs`)。
+- 依赖:`libibverbs.so.1`(能跑 ib_write_bw 即具备);env 可调
+  `VERBS_BLOCK_MB`(默认 64)/`VERBS_N_BLOCKS`(默认 4)/
+  `VERBS_GID_INDEX`(RoCE v2 gid 自动探测不准时手动指定)/
+  `VERBS_DEV`(多网卡指定设备名)。
+- 排障:QP 迁移报 `errno=22` 时对照部署机
+  `/usr/include/infiniband/verbs.h` 的 `ibv_qp_attr_mask` 核对常量;
+  选错网卡用 `VERBS_DEV` 指定;`ibv_devices` 看设备列表。
+
 ## 与正式迁移的关系
 
 | demo 组件 | 正式方案对应(vllm-ascend lwd_comm) |
 |---|---|
-| `send_frame`/`recv_frame` 帧协议 | `lwd_comm/smc_wire.py` 帧编解码(同款头部) |
+| `send_frame`/`recv_frame` 帧协议 | `smc_wire.py`/`verbs_wire.py` 帧编解码(同款头部) |
 | UP 通道(payload+aux) | `LwdChannelType.UP` 的 tensor+aux_tensor |
 | DOWN ACK 帧 | `LwdChannelType.DOWN` 云→边回传 |
 | seqno 帧头校验 | per-channel seqno FIFO 配对契约(防御层) |
 | `--family tcp` 对照 | SMC 自身的 TCP fallback 行为对照 |
+| `--family verbs`(`verbs_demo.py`) | `verbs_wire.py`(握手格式/块池/RC SEND 同款) |
 
-Windows 上无法运行(需 Linux AF_SMC);本目录代码只在边/云 Linux 机器上执行。
+Windows 上无法运行(需 Linux AF_SMC/libibverbs);本目录代码只在
+边/云 Linux 机器上执行。

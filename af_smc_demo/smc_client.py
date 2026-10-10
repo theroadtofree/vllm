@@ -53,13 +53,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="AF_SMC demo: edge side (UP sender)")
     ap.add_argument("--host", required=True, help="云侧 RoCE 网段 IP")
     ap.add_argument("--port", type=int, default=19901)
-    ap.add_argument("--family", choices=["smc", "tcp"], default="smc")
+    ap.add_argument("--family", choices=["smc", "tcp", "verbs"], default="smc")
     ap.add_argument("--frames", type=int, default=100)
     ap.add_argument("--rows", type=int, default=512, help="num_tokens")
     ap.add_argument("--hidden", type=int, default=4096, help="hidden_size (bf16)")
     ap.add_argument("--interval-ms", type=float, default=0.0,
                     help="帧间隔,模拟边侧推理节拍;0=满速压测")
     args = ap.parse_args()
+
+    if args.family == "verbs":
+        import verbs_demo
+
+        return verbs_demo.run_client(args)
 
     payload = build_payload(args.rows, args.hidden)
     aux = build_aux(args.rows)
