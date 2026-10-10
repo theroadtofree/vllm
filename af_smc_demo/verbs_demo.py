@@ -474,10 +474,45 @@ _HS_FMT = "!8sIIII16sI"  # magic, lid, qpn, psn, mtu, gid, max_frame
 _HS_SIZE = struct.calcsize(_HS_FMT)
 
 
+def _find_gid_by_ip(ctx: int, ip_bytes: bytes) -> int | None:
+    """在该设备的 gid 表中找 IPv4-mapped(::ffff:ip) 的 gid index;
+    找不到返回 None。"""
+    pa = _PortAttr()
+    if _ibv.ibv_query_port(ctx, 1, ctypes.byref(pa)) != 0:
+        return None
+    for idx in range(min(max(pa.gid_tbl_len, 1), 32)):
+        gid = (ctypes.c_uint8 * 16)()
+        if _ibv.ibv_query_gid(ctx, 1, idx, ctypes.byref(gid)) != 0:
+            continue
+        raw = bytes(gid)
+        if raw[:10] == b"\x00" * 10 and raw[10:12] == b"\xff\xff" \
+                and raw[12:16] == ip_bytes:
+            return idx
+    return None
+
+
+def _route_source_ip(host: str) -> bytes | None:
+    """UDP connect trick(不发包):内核按路由选出接口,取源 IPv4。
+    用于把设备/gid 选择对齐实际路由(对齐 perftest 的 rdma_cm 行为,
+    避免多网卡时选到非路由口的设备)。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((host, 9))  # discard 端口,仅触发选路
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and ip != "0.0.0.0":
+            return socket.inet_aton(ip)
+    except OSError:
+        pass
+    return None
+
+
 class _Rc:
     """一条 RC QP 及其本地资源(demo 版,单线程使用,无 IO 线程)。"""
 
-    def __init__(self) -> None:
+    def __init__(self, route_host: str = "") -> None:
         if _ibv is None:
             raise RuntimeError("libibverbs.so.1 not found")
         self._ctx = None
@@ -491,6 +526,10 @@ class _Rc:
         self.gid = bytes(16)
         self.gid_index = 0
         self.mtu = _IBV_MTU_4096
+        # 路由对齐:route_host 给定时,设备/gid 按到该地址的源 IP 选
+        self._route_ip = (
+            _route_source_ip(route_host) if route_host else None)
+        self._gid_locked = None  # 路由匹配已定的 gid index
         self._open_and_init_qp()
 
     def _open_and_init_qp(self) -> None:
@@ -499,6 +538,7 @@ class _Rc:
         if not dev_list or n.value <= 0:
             raise RuntimeError("no RDMA devices (ibv_get_device_list empty)")
         chosen = None
+        fallback = None
         try:
             for i in range(n.value):
                 dev = dev_list[i]
@@ -511,11 +551,29 @@ class _Rc:
                 if not ctx:
                     continue
                 pa = _PortAttr()
-                if _ibv.ibv_query_port(ctx, 1, ctypes.byref(pa)) == 0 \
-                        and pa.link_layer == _IBV_LINK_LAYER_ETHERNET:
-                    chosen = (ctx, name.decode(errors="replace"))
-                    break
+                if not (_ibv.ibv_query_port(ctx, 1, ctypes.byref(pa)) == 0
+                        and pa.link_layer == _IBV_LINK_LAYER_ETHERNET):
+                    _ibv.ibv_close_device(ctx)
+                    continue
+                dev_name = name.decode(errors="replace")
+                if self._route_ip is not None:
+                    gid_idx = _find_gid_by_ip(ctx, self._route_ip)
+                    if gid_idx is not None:
+                        # 源 IP 落在此设备的 gid 表 → 路由口就是它
+                        chosen = (ctx, dev_name)
+                        self._gid_locked = gid_idx
+                        break
+                if fallback is None:
+                    fallback = (ctx, dev_name)
+                    continue
                 _ibv.ibv_close_device(ctx)
+            if chosen is None:
+                chosen = fallback
+                if self._route_ip is not None:
+                    print(f"[verbs] warning: no gid matches route source "
+                          f"{socket.inet_ntoa(self._route_ip)!r}; using "
+                          f"first active device {chosen[1] if chosen else None}"
+                          f" — 多网卡时请检查路由或设置 VERBS_DEV")
             if chosen is None:
                 raise RuntimeError(
                     f"no active Ethernet(RoCE) RDMA port found (dev filter "
@@ -563,7 +621,10 @@ class _Rc:
         pa = _PortAttr()
         _ibv.ibv_query_port(self._ctx, self.port, ctypes.byref(pa))
         n_gids = max(pa.gid_tbl_len, 1)
-        if _GID_INDEX_ENV >= 0:
+        if self._gid_locked is not None:
+            # 路由匹配已定(设备+gid 由源 IP 选出,对齐 perftest 行为)
+            self.gid_index = self._gid_locked
+        elif _GID_INDEX_ENV >= 0:
             self.gid_index = _GID_INDEX_ENV
         else:
             self.gid_index = -1
@@ -826,7 +887,7 @@ class VerbsEndpoint:
 
     @classmethod
     def connect(cls, host: str, port: int) -> "VerbsEndpoint":
-        rc = _Rc()
+        rc = _Rc(route_host=host)
         try:
             sock = open_socket("tcp")
             connect_socket(sock, "tcp", host, port)
@@ -847,7 +908,8 @@ class VerbsEndpoint:
         print(f"[cloud] verbs handshake listening on {host}:{port}")
         conn, peer = accept_socket(srv, "tcp")
         srv.close()
-        rc = _Rc()
+        route = None if host in ("", "0.0.0.0") else host
+        rc = _Rc(route_host=route or "")
         try:
             _hs_xchg(conn, rc)
         except Exception:
