@@ -688,7 +688,11 @@ class _Rc:
         for i, b in enumerate(gid):
             attr.ah_attr.grh.dgid[i] = b
         attr.ah_attr.grh.sgid_index = self.gid_index
-        attr.ah_attr.grh.hop_limit = 1
+        # hop_limit 必须 >0 且覆盖拉远路由跳数(真机实录:=1 在 500km
+        # 拉远多跳路径第一跳即被丢,RC 无限重传、send CQE 超时);
+        # traffic_class=106 是 RoCE v2 惯例 DSCP,骨干网据此入无损队列
+        attr.ah_attr.grh.hop_limit = 64
+        attr.ah_attr.grh.traffic_class = 106
         self._modify(
             attr,
             _QP_STATE | _QP_PATH_MTU | _QP_DEST_QPN | _QP_RQ_PSN
