@@ -360,6 +360,57 @@ def _bind_ibv() -> None:
 
 _bind_ibv()
 
+# --------------------------------------------------------------------- #
+# hw ABI(定制 verbs.h):post/poll 走 ibv_context.ops 的用户态函数指针  #
+# --------------------------------------------------------------------- #
+# 实测依据(1010-8 头文件原文 + 1010-5 探测):
+#   ibv_context.ops @ context+8;
+#   ops 表槽位(每槽 8B):poll_cq@ops+88(第 11 槽)、post_send@ops+200
+#   (第 25 槽)、post_recv@ops+208(第 26 槽)。
+# 真机实录:cmd 层 ibv_cmd_post_recv 返回 EOPNOTSUPP(95)——华为驱动
+# 只实现用户态快速路径,ops 表是唯一入口。
+_OPS_POLL_CQ_OFF = 88
+_OPS_POST_SEND_OFF = 200
+_OPS_POST_RECV_OFF = 208
+
+_post_send_fn = None
+_post_recv_fn = None
+_ops_poll_cq_fn = None
+
+
+def _resolve_ops_fns(ctx: int) -> None:
+    """从 ibv_context.ops 按实测偏移取 post_send/post_recv/poll_cq
+    函数指针(hw ABI;进程内一次)。"""
+    global _post_send_fn, _post_recv_fn, _ops_poll_cq_fn
+    if _post_send_fn is not None:
+        return
+    ops_base = ctx + 8
+    send_addr = ctypes.c_void_p.from_address(
+        ops_base + _OPS_POST_SEND_OFF).value
+    recv_addr = ctypes.c_void_p.from_address(
+        ops_base + _OPS_POST_RECV_OFF).value
+    poll_addr = ctypes.c_void_p.from_address(
+        ops_base + _OPS_POLL_CQ_OFF).value
+    if not send_addr or not recv_addr or not poll_addr:
+        raise RuntimeError(
+            "failed to resolve post/poll fns from ibv_context.ops "
+            f"(post_send@+{_OPS_POST_SEND_OFF}, post_recv@"
+            f"+{_OPS_POST_RECV_OFF}, poll_cq@+{_OPS_POLL_CQ_OFF}) — "
+            "对照部署机 verbs.h 的 struct ibv_context_ops 定义"
+        )
+    _post_send_fn = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_SendWr),
+        ctypes.POINTER(ctypes.POINTER(_SendWr)),
+    )(send_addr)
+    _post_recv_fn = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_RecvWr),
+        ctypes.POINTER(ctypes.POINTER(_RecvWr)),
+    )(recv_addr)
+    _ops_poll_cq_fn = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+        ctypes.POINTER(_Wc),
+    )(poll_addr)
+
 # CQ 轮询入口探测:ibv_poll_cq 是 static inline(不导出)。优先
 # ibv_start_poll/ibv_next_poll(rdma-core v35+;部分老版本没有),
 # 退回 ibv_cmd_poll_cq(provider 命令层,libibverbs 为驱动 DSO 导出,
@@ -467,6 +518,8 @@ class _Rc:
         finally:
             _ibv.ibv_free_device_list(dev_list)
         self._ctx, self.dev_name = chosen
+        if _ABI == "hw":
+            _resolve_ops_fns(self._ctx)
         self._pd = _ibv.ibv_alloc_pd(self._ctx)
         if not self._pd:
             raise RuntimeError("ibv_alloc_pd failed")
@@ -602,25 +655,41 @@ class _Rc:
 
     def post_send(self, wr: _SendWr) -> None:
         bad = ctypes.POINTER(_SendWr)()
-        rc = _ibv.ibv_cmd_post_send(
-            ctypes.c_void_p(self.qp), ctypes.byref(wr), ctypes.byref(bad))
+        if _ABI == "hw":
+            rc = _post_send_fn(
+                ctypes.c_void_p(self.qp), ctypes.byref(wr),
+                ctypes.byref(bad))
+        else:
+            rc = _ibv.ibv_cmd_post_send(
+                ctypes.c_void_p(self.qp), ctypes.byref(wr),
+                ctypes.byref(bad))
         if rc != 0:
             raise RuntimeError(
                 f"post_send failed rc={rc}({os.strerror(rc) if rc > 0 else 'verbs err'})")
 
     def post_recv(self, wr: _RecvWr) -> None:
         bad = ctypes.POINTER(_RecvWr)()
-        rc = _ibv.ibv_cmd_post_recv(
-            ctypes.c_void_p(self.qp), ctypes.byref(wr), ctypes.byref(bad))
+        if _ABI == "hw":
+            rc = _post_recv_fn(
+                ctypes.c_void_p(self.qp), ctypes.byref(wr),
+                ctypes.byref(bad))
+        else:
+            rc = _ibv.ibv_cmd_post_recv(
+                ctypes.c_void_p(self.qp), ctypes.byref(wr),
+                ctypes.byref(bad))
         if rc != 0:
             raise RuntimeError(
                 f"post_recv failed rc={rc}({os.strerror(rc) if rc > 0 else 'verbs err'})")
 
     def poll(self, n: int) -> list[_Wc]:
-        """按探测到的入口轮询(start_poll 循环或 cmd_poll_cq 批量;
-        ENOENT=取尽;start_poll 取满上限时 end_poll,余量下次再取)。"""
-        impl = _resolve_poll_impl()
+        """hw ABI:ops.poll_cq 批量(签名/语义与标准 ibv_poll_cq 相同)。
+        std ABI:按探测入口(start_poll 循环或 cmd_poll_cq 批量)。"""
         cq = ctypes.c_void_p(self._cq)
+        if _ABI == "hw":
+            wcs = (_Wc * n)()
+            got = _ops_poll_cq_fn(cq, n, wcs)
+            return [wcs[i] for i in range(max(0, got))]
+        impl = _resolve_poll_impl()
         if impl == "cmd_poll_cq":
             wcs = (_Wc * n)()
             got = _ibv.ibv_cmd_poll_cq(cq, n, wcs)
