@@ -65,9 +65,10 @@ _TRACE = os.getenv("VERBS_TRACE") == "1"
 # 可能构成接收侧节拍)。ACK 内容以帧计数占位,CRC 校验路径跳过
 _NOCRC = os.getenv("VERBS_NOCRC") == "1"
 # GRH 参数可调(拉远排障):VERBS_HOP(默认 64)、VERBS_TC(traffic_class,
-# 默认 106=RoCE v2 惯例 DSCP;若骨干不识别可回 0 对照)
+# 默认 128=本环境实测预期值:骨干按 DSCP=TC>>2=32 规划无损队列;
+# 106 是 RoCE v2 文献惯例值,本环境实测不优)
 _GRH_HOP = int(os.getenv("VERBS_HOP", "64"))
-_GRH_TC = int(os.getenv("VERBS_TC", "106"))
+_GRH_TC = int(os.getenv("VERBS_TC", "128"))
 _PRELOAD = os.getenv("VERBS_PRELOAD") == "1"
 _pack_ns = 0
 _post_ns = 0
