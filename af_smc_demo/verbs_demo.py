@@ -228,7 +228,7 @@ class _GlobalRoute(ctypes.Structure):
     ]
 
 
-class _AhAttr(ctypes.Structure):
+class _AhAttrHw(ctypes.Structure):
     # 实测(sizeof=32):定制 ABI 的 grh 在最前(offset 0),dlid 等
     # 在 24-30 —— 与标准 rdma-core(dlid 在前)正好相反
     _fields_ = [
@@ -243,7 +243,7 @@ class _AhAttr(ctypes.Structure):
     ]
 
 
-class _QpAttr(ctypes.Structure):
+class _QpAttrHw(ctypes.Structure):
     # 实测(sizeof=144,定制 ABI):头部 0-35 与标准一致;
     # ah_attr@56/alt_ah_attr@88 居中,36-55 为定制区(保持 0);
     # pkey_index@120 起尾部字段全部单字节化(min_rnr_timer/port_num/
@@ -259,8 +259,8 @@ class _QpAttr(ctypes.Structure):
         ("dest_qp_num", ctypes.c_uint32),
         ("qp_access_flags", ctypes.c_uint32),
         ("_pad_mid", ctypes.c_uint8 * 20),
-        ("ah_attr", _AhAttr),
-        ("alt_ah_attr", _AhAttr),
+        ("ah_attr", _AhAttrHw),
+        ("alt_ah_attr", _AhAttrHw),
         ("pkey_index", ctypes.c_uint16),
         ("alt_pkey_index", ctypes.c_uint16),
         ("en_sqd_async_notify", ctypes.c_uint8),
@@ -276,6 +276,57 @@ class _QpAttr(ctypes.Structure):
         ("alt_timeout", ctypes.c_uint8),
         ("_pad_tail", ctypes.c_uint8 * 9),
     ]
+
+
+class _AhAttrStd(ctypes.Structure):
+    # 标准 rdma-core verbs.h:dlid 在前、grh 在后(与华为定制版相反)
+    _fields_ = [
+        ("dlid", ctypes.c_uint16),
+        ("sl", ctypes.c_uint8),
+        ("src_path_bits", ctypes.c_uint8),
+        ("static_rate", ctypes.c_uint8),
+        ("is_global", ctypes.c_uint8),
+        ("port_num", ctypes.c_uint8),
+        ("grh", _GlobalRoute),
+    ]
+
+
+class _QpAttrStd(ctypes.Structure):
+    # 标准 rdma-core verbs.h(128B):ah_attr 在尾、min_rnr_timer 等
+    # 尾部字段为 u32/u16(华为定制版是 ah_attr 居中 + 尾部单字节)
+    _fields_ = [
+        ("qp_state", ctypes.c_int),
+        ("cur_qp_state", ctypes.c_int),
+        ("path_mtu", ctypes.c_uint32),
+        ("path_mig_state", ctypes.c_int),
+        ("qkey", ctypes.c_uint32),
+        ("rq_psn", ctypes.c_uint32),
+        ("sq_psn", ctypes.c_uint32),
+        ("dest_qp_num", ctypes.c_uint32),
+        ("qp_access_flags", ctypes.c_uint16),
+        ("pkey_index", ctypes.c_uint16),
+        ("alt_pkey_index", ctypes.c_uint16),
+        ("en_sqd_async_notify", ctypes.c_uint8),
+        ("sq_draining", ctypes.c_uint8),
+        ("max_rd_atomic", ctypes.c_uint8),
+        ("max_dest_rd_atomic", ctypes.c_uint8),
+        ("min_rnr_timer", ctypes.c_uint32),
+        ("port_num", ctypes.c_uint32),
+        ("timeout", ctypes.c_uint16),
+        ("retry_cnt", ctypes.c_uint16),
+        ("rnr_retry", ctypes.c_uint16),
+        ("alt_port_num", ctypes.c_uint16),
+        ("alt_timeout", ctypes.c_uint16),
+        ("ah_attr", _AhAttrStd),
+        ("alt_ah_attr", _AhAttrStd),
+    ]
+
+
+# 按 ABI 选择布局:字段名两版一致,transition 代码零改动
+if _ABI == "hw":
+    _QpAttr, _AhAttr = _QpAttrHw, _AhAttrHw
+else:
+    _QpAttr, _AhAttr = _QpAttrStd, _AhAttrStd
 
 
 class _PortAttr(ctypes.Structure):
@@ -300,8 +351,8 @@ class _PortAttr(ctypes.Structure):
         ("active_speed", ctypes.c_uint8),
         ("phys_state", ctypes.c_uint8),
         ("link_layer", ctypes.c_uint8),
-        # 实测 sizeof=52:尾部还有 4 字节定制区(@47 pad 5B 补齐)
-        ("_pad_tail", ctypes.c_uint8 * 5),
+        # 华为实测 sizeof=52/标准 56:扩尾垫到 56 兼容两端驱动写入
+        ("_pad_tail", ctypes.c_uint8 * 9),
     ]
 
 
