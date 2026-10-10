@@ -64,6 +64,10 @@ _TRACE = os.getenv("VERBS_TRACE") == "1"
 # 处理耗时排查;zlib.crc32 对 4.2MB 帧为 1-4ms 量级,无硬件 CRC 时
 # 可能构成接收侧节拍)。ACK 内容以帧计数占位,CRC 校验路径跳过
 _NOCRC = os.getenv("VERBS_NOCRC") == "1"
+# GRH 参数可调(拉远排障):VERBS_HOP(默认 64)、VERBS_TC(traffic_class,
+# 默认 106=RoCE v2 惯例 DSCP;若骨干不识别可回 0 对照)
+_GRH_HOP = int(os.getenv("VERBS_HOP", "64"))
+_GRH_TC = int(os.getenv("VERBS_TC", "106"))
 _PRELOAD = os.getenv("VERBS_PRELOAD") == "1"
 _pack_ns = 0
 _post_ns = 0
@@ -691,8 +695,8 @@ class _Rc:
         # hop_limit 必须 >0 且覆盖拉远路由跳数(真机实录:=1 在 500km
         # 拉远多跳路径第一跳即被丢,RC 无限重传、send CQE 超时);
         # traffic_class=106 是 RoCE v2 惯例 DSCP,骨干网据此入无损队列
-        attr.ah_attr.grh.hop_limit = 64
-        attr.ah_attr.grh.traffic_class = 106
+        attr.ah_attr.grh.hop_limit = _GRH_HOP
+        attr.ah_attr.grh.traffic_class = _GRH_TC
         self._modify(
             attr,
             _QP_STATE | _QP_PATH_MTU | _QP_DEST_QPN | _QP_RQ_PSN
