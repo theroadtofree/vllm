@@ -533,9 +533,24 @@ _HS_FMT = "!8sIIII16sI"  # magic, lid, qpn, psn, mtu, gid, max_frame
 _HS_SIZE = struct.calcsize(_HS_FMT)
 
 
-def _find_gid_by_ip(ctx: int, ip_bytes: bytes) -> int | None:
-    """在该设备的 gid 表中找 IPv4-mapped(::ffff:ip) 的 gid index;
-    找不到返回 None。"""
+def _gid_is_v2(dev_name: str, port: int, idx: int) -> bool:
+    """读 sysfs 的 gid 类型标记(ibv_devinfo 显示的同源数据)。
+    真机实录:CX5 会把同一 IPv4 同时注册为 v1/v2 两条 gid(如
+    index 2=RoCE v1 / 3=RoCE v2)——v1 是纯以太封装,跨三层路由
+    必丢,拉远场景必须选中 v2。sysfs 不可读时保守放行。
+    """
+    try:
+        with open(f"/sys/class/infiniband/{dev_name}/ports/{port}"
+                  f"/gid_attrs/types/{idx}", encoding="ascii") as f:
+            return "v2" in f.read()
+    except OSError:
+        return True
+
+
+def _find_gid_by_ip(ctx: int, ip_bytes: bytes,
+                    dev_name: str = "") -> int | None:
+    """在该设备的 gid 表中找 IPv4-mapped(::ffff:ip) 且 RoCE v2
+    的 gid index;找不到返回 None。"""
     pa = _PortAttr()
     if _ibv.ibv_query_port(ctx, 1, ctypes.byref(pa)) != 0:
         return None
@@ -544,8 +559,10 @@ def _find_gid_by_ip(ctx: int, ip_bytes: bytes) -> int | None:
         if _ibv.ibv_query_gid(ctx, 1, idx, ctypes.byref(gid)) != 0:
             continue
         raw = bytes(gid)
-        if raw[:10] == b"\x00" * 10 and raw[10:12] == b"\xff\xff" \
-                and raw[12:16] == ip_bytes:
+        if (raw[:10] == b"\x00" * 10 and raw[10:12] == b"\xff\xff"
+                and raw[12:16] == ip_bytes):
+            if dev_name and not _gid_is_v2(dev_name, 1, idx):
+                continue
             return idx
     return None
 
@@ -616,7 +633,8 @@ class _Rc:
                     continue
                 dev_name = name.decode(errors="replace")
                 if self._route_ip is not None:
-                    gid_idx = _find_gid_by_ip(ctx, self._route_ip)
+                    gid_idx = _find_gid_by_ip(
+                        ctx, self._route_ip, dev_name)
                     if gid_idx is not None:
                         # 源 IP 落在此设备的 gid 表 → 路由口就是它
                         chosen = (ctx, dev_name)
