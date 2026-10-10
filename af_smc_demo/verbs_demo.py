@@ -67,35 +67,60 @@ try:
 except OSError:
     _ibv = None
 
+# ABI 值按部署机 verbs_probe.c 的实测校准(openEuler/华为定制 verbs.h,
+# 与标准 rdma-core 差异是系统性的:mask 为稀疏位图、结构体布局不同、
+# 部分枚举值不同)。VERBS_ABI=std 可切回标准 rdma-core 值。
+_ABI = os.getenv("VERBS_ABI", "hw")
+
 _IBV_QPT_RC = 2
 _IBV_QPS_INIT = 1
 _IBV_QPS_RTR = 2
 _IBV_QPS_RTS = 3
-_IBV_MTU_4096 = 4
+_IBV_MTU_4096 = 5 if _ABI == "hw" else 4
 _IBV_ACCESS_LOCAL_WRITE = 1
 _IBV_ACCESS_REMOTE_WRITE = 2
-_IBV_WR_SEND = 0
+_IBV_WR_SEND = 2 if _ABI == "hw" else 0
 _IBV_WC_SUCCESS = 0
 _IBV_WC_RECV = 0x80
-_IBV_SEND_SIGNALED = 1
+_IBV_SEND_SIGNALED = 0x2 if _ABI == "hw" else 0x1
 _IBV_LINK_LAYER_ETHERNET = 2
 
-# ibv_qp_attr_mask 位序(linux uapi verbs.h)
-_QP_STATE = 1 << 0
-_QP_PKEY_INDEX = 1 << 3
-_QP_PORT = 1 << 4
-_QP_RQ_PSN = 1 << 6
-_QP_SQ_PSN = 1 << 7
-_QP_DEST_QP_NUM = 1 << 8
-_QP_ACCESS_FLAGS = 1 << 9
-_QP_PATH_MTU = 1 << 10
-_QP_TIMEOUT = 1 << 11
-_QP_RETRY_CNT = 1 << 12
-_QP_RNR_RETRY = 1 << 13
-_QP_MAX_QP_RD_ATOMIC = 1 << 14
-_QP_MAX_DEST_RD_ATOMIC = 1 << 15
-_QP_MIN_RNR_TIMER = 1 << 16
-_QP_AV = 1 << 17
+if _ABI == "hw":
+    # 实测(1010-3):STATE=1 CUR=2 EN_SQD=4 ACCESS=8 PKEY=10 PORT=20
+    # QKEY=40 AV=80 MTU=100 TIMEOUT=200 RETRY=400 RNR_RETRY=800
+    # RQ_PSN=1000 MAX_RD=2000 MIN_RNR=8000 SQ_PSN=10000
+    # MAX_DEST_RD=20000 DEST_QPN=100000(注意是 QPN 非 QP_NUM)
+    _QP_STATE = 0x1
+    _QP_ACCESS_FLAGS = 0x8
+    _QP_PKEY_INDEX = 0x10
+    _QP_PORT = 0x20
+    _QP_AV = 0x80
+    _QP_PATH_MTU = 0x100
+    _QP_TIMEOUT = 0x200
+    _QP_RETRY_CNT = 0x400
+    _QP_RNR_RETRY = 0x800
+    _QP_RQ_PSN = 0x1000
+    _QP_MAX_QP_RD_ATOMIC = 0x2000
+    _QP_MIN_RNR_TIMER = 0x8000
+    _QP_SQ_PSN = 0x10000
+    _QP_MAX_DEST_RD_ATOMIC = 0x20000
+    _QP_DEST_QPN = 0x100000
+else:
+    _QP_STATE = 1 << 0
+    _QP_PKEY_INDEX = 1 << 3
+    _QP_PORT = 1 << 4
+    _QP_RQ_PSN = 1 << 6
+    _QP_SQ_PSN = 1 << 7
+    _QP_DEST_QPN = 1 << 8
+    _QP_ACCESS_FLAGS = 1 << 9
+    _QP_PATH_MTU = 1 << 10
+    _QP_TIMEOUT = 1 << 11
+    _QP_RETRY_CNT = 1 << 12
+    _QP_RNR_RETRY = 1 << 13
+    _QP_MAX_QP_RD_ATOMIC = 1 << 14
+    _QP_MAX_DEST_RD_ATOMIC = 1 << 15
+    _QP_MIN_RNR_TIMER = 1 << 16
+    _QP_AV = 1 << 17
 
 _QP_TIMEOUT_VAL = 16
 _QP_RETRY_CNT_VAL = 7
@@ -113,6 +138,8 @@ class _Sge(ctypes.Structure):
 
 
 class _SendWr(ctypes.Structure):
+    # 实测 sizeof=128:头部 0-40 与标准一致,40-127 是定制扩展区
+    # (保持 0,Structure 默认零初始化)
     _fields_ = [
         ("wr_id", ctypes.c_uint64),
         ("next", ctypes.c_void_p),
@@ -121,7 +148,7 @@ class _SendWr(ctypes.Structure):
         ("opcode", ctypes.c_int),
         ("send_flags", ctypes.c_int),
         ("imm_data", ctypes.c_uint32),
-        ("pad", ctypes.c_uint32),
+        ("_pad_ext", ctypes.c_uint8 * 88),
     ]
 
 
@@ -175,6 +202,8 @@ class _QpInitAttr(ctypes.Structure):
 
 
 class _GlobalRoute(ctypes.Structure):
+    # 实测 sizeof=24:dgid@0 flow_label@16 sgid_index@20 hop_limit@21
+    # traffic_class@22(与标准一致)
     _fields_ = [
         ("dgid", ctypes.c_uint8 * 16),
         ("flow_label", ctypes.c_uint32),
@@ -185,18 +214,25 @@ class _GlobalRoute(ctypes.Structure):
 
 
 class _AhAttr(ctypes.Structure):
+    # 实测(sizeof=32):定制 ABI 的 grh 在最前(offset 0),dlid 等
+    # 在 24-30 —— 与标准 rdma-core(dlid 在前)正好相反
     _fields_ = [
+        ("grh", _GlobalRoute),
         ("dlid", ctypes.c_uint16),
         ("sl", ctypes.c_uint8),
         ("src_path_bits", ctypes.c_uint8),
         ("static_rate", ctypes.c_uint8),
         ("is_global", ctypes.c_uint8),
         ("port_num", ctypes.c_uint8),
-        ("grh", _GlobalRoute),
+        ("_pad", ctypes.c_uint8),
     ]
 
 
 class _QpAttr(ctypes.Structure):
+    # 实测(sizeof=144,定制 ABI):头部 0-35 与标准一致;
+    # ah_attr@56/alt_ah_attr@88 居中,36-55 为定制区(保持 0);
+    # pkey_index@120 起尾部字段全部单字节化(min_rnr_timer/port_num/
+    # timeout/retry_cnt/rnr_retry 等是 u8,非标准的 u32/u16)
     _fields_ = [
         ("qp_state", ctypes.c_int),
         ("cur_qp_state", ctypes.c_int),
@@ -206,22 +242,24 @@ class _QpAttr(ctypes.Structure):
         ("rq_psn", ctypes.c_uint32),
         ("sq_psn", ctypes.c_uint32),
         ("dest_qp_num", ctypes.c_uint32),
-        ("qp_access_flags", ctypes.c_uint16),
+        ("qp_access_flags", ctypes.c_uint32),
+        ("_pad_mid", ctypes.c_uint8 * 20),
+        ("ah_attr", _AhAttr),
+        ("alt_ah_attr", _AhAttr),
         ("pkey_index", ctypes.c_uint16),
         ("alt_pkey_index", ctypes.c_uint16),
         ("en_sqd_async_notify", ctypes.c_uint8),
         ("sq_draining", ctypes.c_uint8),
         ("max_rd_atomic", ctypes.c_uint8),
         ("max_dest_rd_atomic", ctypes.c_uint8),
-        ("min_rnr_timer", ctypes.c_uint32),
-        ("port_num", ctypes.c_uint32),
-        ("timeout", ctypes.c_uint16),
-        ("retry_cnt", ctypes.c_uint16),
-        ("rnr_retry", ctypes.c_uint16),
-        ("alt_port_num", ctypes.c_uint16),
-        ("alt_timeout", ctypes.c_uint16),
-        ("ah_attr", _AhAttr),
-        ("alt_ah_attr", _AhAttr),
+        ("min_rnr_timer", ctypes.c_uint8),
+        ("port_num", ctypes.c_uint8),
+        ("timeout", ctypes.c_uint8),
+        ("retry_cnt", ctypes.c_uint8),
+        ("rnr_retry", ctypes.c_uint8),
+        ("alt_port_num", ctypes.c_uint8),
+        ("alt_timeout", ctypes.c_uint8),
+        ("_pad_tail", ctypes.c_uint8 * 9),
     ]
 
 
@@ -247,6 +285,8 @@ class _PortAttr(ctypes.Structure):
         ("active_speed", ctypes.c_uint8),
         ("phys_state", ctypes.c_uint8),
         ("link_layer", ctypes.c_uint8),
+        # 实测 sizeof=52:尾部还有 4 字节定制区(@47 pad 5B 补齐)
+        ("_pad_tail", ctypes.c_uint8 * 5),
     ]
 
 
@@ -526,7 +566,7 @@ class _Rc:
         attr.ah_attr.grh.hop_limit = 1
         self._modify(
             attr,
-            _QP_STATE | _QP_PATH_MTU | _QP_DEST_QP_NUM | _QP_RQ_PSN
+            _QP_STATE | _QP_PATH_MTU | _QP_DEST_QPN | _QP_RQ_PSN
             | _QP_MAX_DEST_RD_ATOMIC | _QP_MIN_RNR_TIMER | _QP_AV,
             "INIT->RTR",
         )
