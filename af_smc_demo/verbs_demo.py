@@ -30,7 +30,9 @@ VERBS_GID_INDEX(自动探测不准时手动指定,RoCE v2)、VERBS_DEV
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import errno
 import json
 import os
 import socket
@@ -297,10 +299,18 @@ def _bind_ibv() -> None:
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
     ]
     _ibv.ibv_reg_mr.restype = ctypes.POINTER(_Mr)
-    _ibv.ibv_poll_cq.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_Wc),
+    # ibv_poll_cq 也是 verbs.h 的 static inline(不导出,同
+    # ibv_post_send 的 undefined symbol 问题)——改用导出的
+    # ibv_start_poll/ibv_next_poll(rdma-core v17+ 必有)
+    _ibv.ibv_start_poll.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_Wc),
     ]
-    _ibv.ibv_poll_cq.restype = ctypes.c_int
+    _ibv.ibv_start_poll.restype = ctypes.c_int
+    _ibv.ibv_next_poll.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_Wc),
+    ]
+    _ibv.ibv_next_poll.restype = ctypes.c_int
+    _ibv.ibv_end_poll.argtypes = [ctypes.c_void_p]
     _ibv.ibv_destroy_qp.argtypes = [ctypes.c_void_p]
     _ibv.ibv_destroy_cq.argtypes = [ctypes.c_void_p]
     _ibv.ibv_dereg_mr.argtypes = [ctypes.POINTER(_Mr)]
@@ -551,9 +561,33 @@ class _Rc:
             raise RuntimeError("post_recv failed")
 
     def poll(self, n: int) -> list[_Wc]:
-        wcs = (_Wc * n)()
-        got = _ibv.ibv_poll_cq(ctypes.c_void_p(self._cq), n, wcs)
-        return [wcs[i] for i in range(max(0, got))]
+        """经 start_poll/next_poll 轮询(ENOENT=取尽);达到 n 条上限
+        时 end_poll 结束序列,余量下次再取。"""
+        out: list[_Wc] = []
+        wc = _Wc()
+        cq = ctypes.c_void_p(self._cq)
+        rc = _ibv.ibv_start_poll(cq, ctypes.byref(wc))
+        if rc == errno.ENOENT:
+            return out
+        if rc != 0:
+            raise RuntimeError(f"ibv_start_poll failed errno={rc}")
+        reached_cap = False
+        try:
+            while True:
+                out.append(_Wc.from_buffer_copy(wc))
+                if len(out) >= n:
+                    reached_cap = True
+                    break
+                rc = _ibv.ibv_next_poll(cq, ctypes.byref(wc))
+                if rc == errno.ENOENT:
+                    return out
+                if rc != 0:
+                    raise RuntimeError(f"ibv_next_poll failed errno={rc}")
+        finally:
+            if reached_cap:
+                with contextlib.suppress(Exception):
+                    _ibv.ibv_end_poll(cq)
+        return out
 
     def destroy(self) -> None:
         if self.qp:
