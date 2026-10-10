@@ -617,11 +617,21 @@ class _Rc:
                                      ctypes.byref(attr))
         if not self.qp:
             raise RuntimeError("ibv_create_qp failed")
-        # 定制 ABI 实测(1010-5):struct ibv_qp 的 pd@16/handle@48/
-        # qp_num@52(标准头文件是 pd@8/handle@16/qp_num@20,不可混用)
+        # qp_num 偏移按网卡 ABI 分(真机实录):mlx5(标准 rdma-core)
+        # 在 offset 20;华为定制 verbs.h 在 offset 52(pd@16/handle@48)。
+        # 读错偏移 = 握手交换垃圾 QPN → 两端 RC 互不认包(A 环境全华为
+        # 卡时恰好同偏移所以通;B 环境云侧 CX5 暴露)。
         qp_words = ctypes.cast(ctypes.c_void_p(self.qp),
                                ctypes.POINTER(ctypes.c_uint32))
-        self.qpn = int(qp_words[13])  # 52 / 4
+        is_std = self.dev_name.startswith("mlx5")
+        off = (20 if is_std else 52) // 4
+        qpn = int(qp_words[off])
+        if not 0 < qpn < (1 << 24):  # QPN 合理范围兜底
+            alt = int(qp_words[(52 if is_std else 20) // 4])
+            print(f"[verbs] warning: qp_num@{off * 4}={qpn} 不合理, "
+                  f"试另一偏移值 {alt}")
+            qpn = alt
+        self.qpn = qpn
         self.psn = 0
         self._to_init()
 
