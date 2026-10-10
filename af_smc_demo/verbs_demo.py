@@ -297,16 +297,6 @@ def _bind_ibv() -> None:
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
     ]
     _ibv.ibv_reg_mr.restype = ctypes.POINTER(_Mr)
-    _ibv.ibv_post_send.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(_SendWr),
-        ctypes.POINTER(ctypes.POINTER(_SendWr)),
-    ]
-    _ibv.ibv_post_send.restype = ctypes.c_int
-    _ibv.ibv_post_recv.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(_RecvWr),
-        ctypes.POINTER(ctypes.POINTER(_RecvWr)),
-    ]
-    _ibv.ibv_post_recv.restype = ctypes.c_int
     _ibv.ibv_poll_cq.argtypes = [
         ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_Wc),
     ]
@@ -320,6 +310,43 @@ def _bind_ibv() -> None:
 
 
 _bind_ibv()
+
+# ibv_post_send/ibv_post_recv 是 verbs.h 里的 static inline(经
+# ibv_context.ops 函数表分发),libibverbs.so 不导出(真机实录:
+# undefined symbol: ibv_post_send)。从 ops 表取函数指针:
+# struct ibv_context { device(8B); ops(内嵌); ... }
+# post_send/post_recv 是 ops 第 19/20 个槽位(索引 18/19,ABI 新字段
+# 只能尾部追加,此位置自 ABI 起未变)。
+_OPS_POST_SEND_IDX = 18
+_OPS_POST_RECV_IDX = 19
+
+_post_send_fn = None
+_post_recv_fn = None
+
+
+def _resolve_post_fns(ctx: int) -> None:
+    global _post_send_fn, _post_recv_fn
+    if _post_send_fn is not None:
+        return
+    send_addr = ctypes.c_void_p.from_address(
+        ctx + 8 + _OPS_POST_SEND_IDX * 8).value
+    recv_addr = ctypes.c_void_p.from_address(
+        ctx + 8 + _OPS_POST_RECV_IDX * 8).value
+    if not send_addr or not recv_addr:
+        raise RuntimeError(
+            "failed to resolve post_send/post_recv from ibv_context.ops"
+            f" (idx {_OPS_POST_SEND_IDX}/{_OPS_POST_RECV_IDX}) — 对照"
+            "/usr/include/infiniband/verbs.h 的 ibv_context_ops 字段"
+            "顺序核对索引"
+        )
+    _post_send_fn = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_SendWr),
+        ctypes.POINTER(ctypes.POINTER(_SendWr)),
+    )(send_addr)
+    _post_recv_fn = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_RecvWr),
+        ctypes.POINTER(ctypes.POINTER(_RecvWr)),
+    )(recv_addr)
 
 _HS_MAGIC = b"LWDV1\0\0\0"
 _HS_FMT = "!8sIIII16sI"  # magic, lid, qpn, psn, mtu, gid, max_frame
@@ -377,6 +404,7 @@ class _Rc:
         finally:
             _ibv.ibv_free_device_list(dev_list)
         self._ctx, self.dev_name = chosen
+        _resolve_post_fns(self._ctx)
         self._pd = _ibv.ibv_alloc_pd(self._ctx)
         if not self._pd:
             raise RuntimeError("ibv_alloc_pd failed")
@@ -512,15 +540,15 @@ class _Rc:
 
     def post_send(self, wr: _SendWr) -> None:
         bad = ctypes.POINTER(_SendWr)()
-        if _ibv.ibv_post_send(ctypes.c_void_p(self.qp), ctypes.byref(wr),
-                              ctypes.byref(bad)) != 0:
-            raise RuntimeError("ibv_post_send failed")
+        if _post_send_fn(ctypes.c_void_p(self.qp), ctypes.byref(wr),
+                         ctypes.byref(bad)) != 0:
+            raise RuntimeError("post_send failed")
 
     def post_recv(self, wr: _RecvWr) -> None:
         bad = ctypes.POINTER(_RecvWr)()
-        if _ibv.ibv_post_recv(ctypes.c_void_p(self.qp), ctypes.byref(wr),
-                              ctypes.byref(bad)) != 0:
-            raise RuntimeError("ibv_post_recv failed")
+        if _post_recv_fn(ctypes.c_void_p(self.qp), ctypes.byref(wr),
+                         ctypes.byref(bad)) != 0:
+            raise RuntimeError("post_recv failed")
 
     def poll(self, n: int) -> list[_Wc]:
         wcs = (_Wc * n)()
