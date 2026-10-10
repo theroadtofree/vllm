@@ -164,5 +164,29 @@ int main(void)
     S(struct ibv_context);
     O(struct ibv_context, device);
     O(struct ibv_context, ops);
+
+    printf("== ibv_context_ops(用户态快速路径的槽位,post/poll 必须走这里) ==\n");
+    S(struct ibv_context_ops);
+    O(struct ibv_context_ops, query_device);
+    O(struct ibv_context_ops, query_port);
+    O(struct ibv_context_ops, alloc_pd);
+    O(struct ibv_context_ops, dealloc_pd);
+    O(struct ibv_context_ops, reg_mr);
+    O(struct ibv_context_ops, dereg_mr);
+    O(struct ibv_context_ops, create_cq);
+    O(struct ibv_context_ops, destroy_cq);
+    O(struct ibv_context_ops, create_qp);
+    O(struct ibv_context_ops, query_qp);
+    O(struct ibv_context_ops, modify_qp);
+    O(struct ibv_context_ops, destroy_qp);
+    O(struct ibv_context_ops, post_send);
+    O(struct ibv_context_ops, post_recv);
+    O(struct ibv_context_ops, create_comp_channel);
+    O(struct ibv_context_ops, destroy_comp_channel);
+    O(struct ibv_context_ops, get_cq_event);
+    O(struct ibv_context_ops, ack_cq_events);
+    /* 若下行编译报 undeclared,说明定制头文件的 ops 没有 poll_cq
+     * 成员(ibv_poll_cq 走了别的实现路径)——把编译错误发回 */
+    O(struct ibv_context_ops, poll_cq);
     return 0;
 }

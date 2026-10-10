@@ -491,11 +491,11 @@ class _Rc:
                                      ctypes.byref(attr))
         if not self.qp:
             raise RuntimeError("ibv_create_qp failed")
-        # struct ibv_qp 头部 {ctx, pd, handle(u32), qp_num(u32)}:
-        # qp_num 位于 offset 20
+        # 定制 ABI 实测(1010-5):struct ibv_qp 的 pd@16/handle@48/
+        # qp_num@52(标准头文件是 pd@8/handle@16/qp_num@20,不可混用)
         qp_words = ctypes.cast(ctypes.c_void_p(self.qp),
                                ctypes.POINTER(ctypes.c_uint32))
-        self.qpn = int(qp_words[5])
+        self.qpn = int(qp_words[13])  # 52 / 4
         self.psn = 0
         self._to_init()
 
