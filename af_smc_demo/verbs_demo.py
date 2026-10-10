@@ -602,17 +602,19 @@ class _Rc:
 
     def post_send(self, wr: _SendWr) -> None:
         bad = ctypes.POINTER(_SendWr)()
-        if _ibv.ibv_cmd_post_send(
-                ctypes.c_void_p(self.qp), ctypes.byref(wr),
-                ctypes.byref(bad)) != 0:
-            raise RuntimeError("post_send failed")
+        rc = _ibv.ibv_cmd_post_send(
+            ctypes.c_void_p(self.qp), ctypes.byref(wr), ctypes.byref(bad))
+        if rc != 0:
+            raise RuntimeError(
+                f"post_send failed rc={rc}({os.strerror(rc) if rc > 0 else 'verbs err'})")
 
     def post_recv(self, wr: _RecvWr) -> None:
         bad = ctypes.POINTER(_RecvWr)()
-        if _ibv.ibv_cmd_post_recv(
-                ctypes.c_void_p(self.qp), ctypes.byref(wr),
-                ctypes.byref(bad)) != 0:
-            raise RuntimeError("post_recv failed")
+        rc = _ibv.ibv_cmd_post_recv(
+            ctypes.c_void_p(self.qp), ctypes.byref(wr), ctypes.byref(bad))
+        if rc != 0:
+            raise RuntimeError(
+                f"post_recv failed rc={rc}({os.strerror(rc) if rc > 0 else 'verbs err'})")
 
     def poll(self, n: int) -> list[_Wc]:
         """按探测到的入口轮询(start_poll 循环或 cmd_poll_cq 批量;

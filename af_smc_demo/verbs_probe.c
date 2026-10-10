@@ -139,5 +139,30 @@ int main(void)
     O(struct ibv_port_attr, max_msg_sz);
     O(struct ibv_port_attr, lid);
     O(struct ibv_port_attr, link_layer);
+
+    printf("== opaque handle structs (post_recv EINVAL 排查) ==\n");
+    S(struct ibv_mr);
+    O(struct ibv_mr, context);
+    O(struct ibv_mr, pd);
+    O(struct ibv_mr, addr);
+    O(struct ibv_mr, length);
+    O(struct ibv_mr, handle);
+    O(struct ibv_mr, lkey);
+    O(struct ibv_mr, rkey);
+    S(struct ibv_qp);
+    O(struct ibv_qp, context);
+    O(struct ibv_qp, pd);
+    O(struct ibv_qp, handle);
+    O(struct ibv_qp, qp_num);
+    S(struct ibv_cq);
+    O(struct ibv_cq, context);
+    O(struct ibv_cq, handle);
+    O(struct ibv_cq, cqe);
+    S(struct ibv_pd);
+    O(struct ibv_pd, context);
+    O(struct ibv_pd, handle);
+    S(struct ibv_context);
+    O(struct ibv_context, device);
+    O(struct ibv_context, ops);
     return 0;
 }
