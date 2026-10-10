@@ -56,6 +56,13 @@ from smc_common import (
 # --------------------------------------------------------------------- #
 _BLOCK_BYTES = int(os.getenv("VERBS_BLOCK_MB", "64")) << 20
 _N_BLOCKS = max(2, int(os.getenv("VERBS_N_BLOCKS", "4")))
+# 诊断开关:VERBS_TRACE=1 打印 send_frame 内部耗时分解(pack 拷贝 vs
+# post 提交);VERBS_PRELOAD=1 时 payload 每块只写一次(发送仅更新
+# 28B header,消除每帧 4MB Python memcpy——吞吐口径有效,CRC 不变)
+_TRACE = os.getenv("VERBS_TRACE") == "1"
+_PRELOAD = os.getenv("VERBS_PRELOAD") == "1"
+_pack_ns = 0
+_post_ns = 0
 _GID_INDEX_ENV = int(os.getenv("VERBS_GID_INDEX", "-1"))
 _DEVICE_ENV = os.getenv("VERBS_DEV", "")
 
@@ -774,7 +781,7 @@ def _recv_exact(sock, n: int) -> bytes:
 
 class _Block:
     __slots__ = ("buf", "addr", "lkey", "index", "sge", "wr", "recv_sge",
-                 "recv_wr")
+                 "recv_wr", "preloaded")
 
     def __init__(self, rc: _Rc, index: int) -> None:
         self.buf = bytearray(_BLOCK_BYTES)
@@ -786,6 +793,7 @@ class _Block:
         self.wr = None
         self.recv_sge = None
         self.recv_wr = None
+        self.preloaded = False  # VERBS_PRELOAD=1 时 payload 只写一次
 
 
 class VerbsEndpoint:
@@ -902,11 +910,15 @@ class VerbsEndpoint:
             raise RuntimeError(
                 f"frame {total} > block {_BLOCK_BYTES};调大 VERBS_BLOCK_MB")
         blk = self._acquire_block()
+        t0 = time.perf_counter_ns()
         blk.buf[: HEADER.size] = HEADER.pack(
             MAGIC, seqno, len(payload), len(aux))
-        blk.buf[HEADER.size: HEADER.size + len(payload)] = payload
-        if aux:
-            blk.buf[HEADER.size + len(payload): total] = aux
+        if not (_PRELOAD and blk.preloaded):
+            blk.buf[HEADER.size: HEADER.size + len(payload)] = payload
+            if aux:
+                blk.buf[HEADER.size + len(payload): total] = aux
+            blk.preloaded = True
+        t1 = time.perf_counter_ns()
         sge = _Sge(blk.addr, total, blk.lkey)
         wr = _SendWr()
         wr.wr_id = blk.index
@@ -919,6 +931,11 @@ class VerbsEndpoint:
         self._posted[blk.index] = blk
         self._inflight += 1
         self.rc.post_send(wr)
+        t2 = time.perf_counter_ns()
+        if _TRACE:
+            global _pack_ns, _post_ns
+            _pack_ns += t1 - t0
+            _post_ns += t2 - t1
 
     def _acquire_block(self) -> _Block:
         deadline = time.monotonic() + 10.0
@@ -994,6 +1011,12 @@ def run_client(args) -> int:
             time.sleep(args.interval_ms / 1000.0)
 
     ep.drain()
+    if _TRACE:
+        global _pack_ns, _post_ns
+        n = max(1, args.frames)
+        print(f"[trace] send_frame 分解(均值/帧): pack拷贝="
+              f"{_pack_ns / n / 1e6:.2f}ms post提交={_post_ns / n / 1e6:.2f}ms "
+              f"(其余=取块/构造)")
     ack_seqno, ack_body, _ = ep.recv_frame()
     ack = json.loads(bytes(ack_body))
     e2e = now() - t_start
