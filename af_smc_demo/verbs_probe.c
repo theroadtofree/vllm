@@ -99,23 +99,71 @@ int main(void)
 
     printf("== qp_attr_mask values ==\n");
     M(IBV_QP_STATE);
+#ifdef IBV_QP_CUR_STATE
     M(IBV_QP_CUR_STATE);
+#endif
+#ifdef IBV_QP_EN_SQD_ASYNC_NOTIFY
     M(IBV_QP_EN_SQD_ASYNC_NOTIFY);
+#endif
+#ifdef IBV_QP_PKEY_INDEX
     M(IBV_QP_PKEY_INDEX);
+#endif
+#ifdef IBV_QP_PORT
     M(IBV_QP_PORT);
+#endif
+#ifdef IBV_QP_QKEY
     M(IBV_QP_QKEY);
+#endif
+#ifdef IBV_QP_RQ_PSN
     M(IBV_QP_RQ_PSN);
+#endif
+#ifdef IBV_QP_SQ_PSN
     M(IBV_QP_SQ_PSN);
+#endif
+    /* 本机头文件可能是定制版:DEST_QPN(华为/老版命名)或标准的
+     * DEST_QP_NUM,两者都探测 */
+#ifdef IBV_QP_DEST_QPN
+    M(IBV_QP_DEST_QPN);
+#endif
+#ifdef IBV_QP_DEST_QP_NUM
     M(IBV_QP_DEST_QP_NUM);
+#endif
+#ifdef IBV_QP_ACCESS_FLAGS
     M(IBV_QP_ACCESS_FLAGS);
+#endif
+#ifdef IBV_QP_PATH_MTU
     M(IBV_QP_PATH_MTU);
+#endif
+#ifdef IBV_QP_TIMEOUT
     M(IBV_QP_TIMEOUT);
+#endif
+#ifdef IBV_QP_RETRY_CNT
     M(IBV_QP_RETRY_CNT);
+#endif
+#ifdef IBV_QP_RNR_RETRY
     M(IBV_QP_RNR_RETRY);
+#endif
+#ifdef IBV_QP_MAX_QP_RD_ATOMIC
     M(IBV_QP_MAX_QP_RD_ATOMIC);
+#endif
+#ifdef IBV_QP_MAX_DEST_RD_ATOMIC
     M(IBV_QP_MAX_DEST_RD_ATOMIC);
+#endif
+#ifdef IBV_QP_MIN_RNR_TIMER
     M(IBV_QP_MIN_RNR_TIMER);
+#endif
+#ifdef IBV_QP_AV
     M(IBV_QP_AV);
+#endif
+    /* 本机头文件版本标识,便于对照 */
+#ifdef IBV_QP_ALT_TIMEOUT
+    M(IBV_QP_ALT_TIMEOUT);
+#endif
+#ifdef IBV_QP_RATE_LIMIT
+    printf("header: rdma-core (has IBV_QP_RATE_LIMIT)\n");
+#else
+    printf("header: custom/legacy (no IBV_QP_RATE_LIMIT)\n");
+#endif
 
     printf("== enums ==\n");
     printf("IBV_QPS_RESET=%d INIT=%d RTR=%d RTS=%d\n",
