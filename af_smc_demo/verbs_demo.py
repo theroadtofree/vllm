@@ -137,7 +137,7 @@ else:
     _QP_MIN_RNR_TIMER = 1 << 16
     _QP_AV = 1 << 17
 
-_QP_TIMEOUT_VAL = 16
+_QP_TIMEOUT_VAL = int(os.getenv("VERBS_QP_TIMEOUT", "16"))
 _QP_RETRY_CNT_VAL = 7
 _QP_RNR_RETRY_VAL = 7
 _QP_MIN_RNR_TIMER_VAL = 16
