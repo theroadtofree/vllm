@@ -60,6 +60,10 @@ _N_BLOCKS = max(2, int(os.getenv("VERBS_N_BLOCKS", "4")))
 # post 提交);VERBS_PRELOAD=1 时 payload 每块只写一次(发送仅更新
 # 28B header,消除每帧 4MB Python memcpy——吞吐口径有效,CRC 不变)
 _TRACE = os.getenv("VERBS_TRACE") == "1"
+# 诊断开关:VERBS_NOCRC=1 时 server 跳过逐帧 CRC 计算(接收侧串行
+# 处理耗时排查;zlib.crc32 对 4.2MB 帧为 1-4ms 量级,无硬件 CRC 时
+# 可能构成接收侧节拍)。ACK 内容以帧计数占位,CRC 校验路径跳过
+_NOCRC = os.getenv("VERBS_NOCRC") == "1"
 _PRELOAD = os.getenv("VERBS_PRELOAD") == "1"
 _pack_ns = 0
 _post_ns = 0
@@ -1087,7 +1091,8 @@ def run_client(args) -> int:
               f"entries={len(ack)}")
         ep.close()
         return 1
-    bad = [s for s, c in ack.items() if c != expected_crc]
+    # c==0 是 server 侧 VERBS_NOCRC=1 的占位(诊断模式跳过校验)
+    bad = [s for s, c in ack.items() if c not in (0, expected_crc)]
     print(f"[edge] send-side  {send_stats.summary(e2e)}")
     print(f"[edge] end-to-end frames={args.frames} "
           f"bytes={frame_bytes * args.frames / 1e6:.1f}MB "
@@ -1117,7 +1122,7 @@ def run_server(args) -> int:
                   f"got {seqno}")
             ep.close()
             return 1
-        crcs[str(seqno)] = zlib.crc32(payload)
+        crcs[str(seqno)] = 0 if _NOCRC else zlib.crc32(payload)
         if (expected + 1) % 20 == 0:
             print(f"[cloud] received {expected + 1}/{args.frames}")
 

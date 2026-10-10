@@ -188,5 +188,19 @@ int main(void)
     /* 若下行编译报 undeclared,说明定制头文件的 ops 没有 poll_cq
      * 成员(ibv_poll_cq 走了别的实现路径)——把编译错误发回 */
     O(struct ibv_context_ops, poll_cq);
+
+    printf("== ibv_cq_attr(CQ moderation,CQE 投递合并控制) ==\n");
+    S(struct ibv_cq_attr);
+    O(struct ibv_cq_attr, comp_mask);
+    /* 枚举成员非宏不能 #ifdef,直接打;编译报 undeclared 即为定制
+     * 命名不同,按提示改后重跑 */
+    O(struct ibv_cq_attr, moderation_cq_count);
+    O(struct ibv_cq_attr, moderation_cq_period);
+    printf("mask IBV_CQ_MODERATE=0x%llx\n",
+           (unsigned long long)IBV_CQ_MODERATE);
+    printf("mask IBV_CQ_ATTR_CQ_COUNT=0x%llx\n",
+           (unsigned long long)IBV_CQ_ATTR_CQ_COUNT);
+    printf("mask IBV_CQ_ATTR_CQ_PERIOD=0x%llx\n",
+           (unsigned long long)IBV_CQ_ATTR_CQ_PERIOD);
     return 0;
 }
