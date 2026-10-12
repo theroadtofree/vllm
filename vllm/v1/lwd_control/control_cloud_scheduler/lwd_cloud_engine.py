@@ -50,9 +50,11 @@ logger = init_logger(__name__)
 
 
 def _lwd_diag_token_passthrough_enabled() -> bool:
-    """诊断开关:SKIP_SAMPLE(边免采样)/ DISABLE_DOWN(全直通)任一开启。"""
+    """诊断开关:SKIP_SAMPLE(边免采样)/ DISABLE_DOWN(全直通)/
+    SKIP_DOWN_RECV(边免接收,云照发)任一开启即捎带 token ids。"""
     return (os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1"
-            or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1")
+            or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
+            or os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_DOWN_RECV") == "1")
 
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
