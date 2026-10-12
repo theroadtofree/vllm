@@ -56,6 +56,45 @@ def _lwd_diag_token_passthrough_enabled() -> bool:
             or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
             or os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_DOWN_RECV") == "1")
 
+
+class _LwdEngineStats:
+    """云引擎主循环分段聚合(error 级、5s 一条,不逐步打印):
+    step_exec=步执行(调度+计算);down_tax=每步 DOWN 侧 LWD 税
+    (carrier 解码+pinned tolist+c2e publish);preout=PRE_OUT 消息
+    分派(chunk 接纳)。线程间计数,锁保护。"""
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._segs: dict[str, list] = {}  # name -> [n, total_s, max_s]
+        self._flushed_at = time.monotonic()
+
+    def add(self, name: str, seconds: float) -> None:
+        with self._lock:
+            seg = self._segs.setdefault(name, [0, 0.0, 0.0])
+            seg[0] += 1
+            seg[1] += seconds
+            if seconds > seg[2]:
+                seg[2] = seconds
+
+    def flush(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            parts = []
+            for name, (n, total, mx) in self._segs.items():
+                if n:
+                    parts.append(
+                        f"{name}: n={n} avg={total / n * 1000:.2f}ms "
+                        f"max={mx * 1000:.2f}ms"
+                    )
+            self._segs.clear()
+            window = now - self._flushed_at
+            self._flushed_at = now
+        if parts:
+            logger.error("[Lwd][stats] cloud-engine %.0fs: %s", window,
+                         "; ".join(parts))
+
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
@@ -83,6 +122,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             if scheduler_name in ("prefill_first", "decode_first")
             else LwdCloudMixedScheduler
         )
+        self._lwd_engine_stats = _LwdEngineStats()
         super().__init__(*args, **kwargs)
 
     def _lwd_setup_zmq(self) -> None:
@@ -160,11 +200,15 @@ class LwdCloudEngineCore(EngineCoreProc):
             return
         while True:
             msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
+            # 分段聚合冲刷拍:recv 超时 5s 一拍,引擎空转也保证 stats 输出
+            self._lwd_engine_stats.flush()
             if msg is None:
                 if self._lwd_subscriber.closed:
                     break
                 continue
+            _t0 = time.monotonic()
             self._lwd_dispatch(msg)
+            self._lwd_engine_stats.add("preout", time.monotonic() - _t0)
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
@@ -349,6 +393,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
         _t0 = time.monotonic()
         out = super().step_with_batch_queue()
+        self._lwd_engine_stats.add("step_exec", time.monotonic() - _t0)
         logger.info(
             "[Lwd][perf] cloud-step exec=%.2fms",
             (time.monotonic() - _t0) * 1000,
@@ -359,6 +404,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         """同步步路径同款打点。"""
         _t0 = time.monotonic()
         out = super().step()
+        self._lwd_engine_stats.add("step_exec", time.monotonic() - _t0)
         logger.info(
             "[Lwd][perf] cloud-step exec=%.2fms",
             (time.monotonic() - _t0) * 1000,
@@ -381,6 +427,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 覆写):开始执行→执行结束,不含无请求的空等。
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
+            _tax_t0 = time.monotonic()
             pinned, req_ids, hidden_numel, seqno = carrier
             n_req = len(req_ids)
             vals = pinned.tolist()
@@ -419,6 +466,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
                 token_ids,
             )
+            self._lwd_engine_stats.add("down_tax", time.monotonic() - _tax_t0)
             # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
             logger.info(
                 "[Lwd][perf] publish reqs=%d dur=%.2fms",
