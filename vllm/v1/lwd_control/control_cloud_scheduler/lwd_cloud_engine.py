@@ -137,6 +137,9 @@ class LwdCloudEngineCore(EngineCoreProc):
             else LwdCloudMixedScheduler
         )
         self._lwd_engine_stats = _LwdEngineStats()
+        _spec = getattr(vllm_config.speculative_config,
+                        "num_speculative_tokens", None) or 0
+        self._lwd_spec_k = int(_spec)
         super().__init__(*args, **kwargs)
         self._lwd_wrap_step_internals()
 
@@ -500,11 +503,13 @@ class LwdCloudEngineCore(EngineCoreProc):
                 meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
-            # MTP 接受率直接计量:Σaccepted / Σ行(行=accepted+1/请求)
-            _rows = sum(seg_lens)
-            if _rows:
+            # MTP 接受率直接计量:Σaccepted / (请求数 × 投机步数 k)。
+            # 实测 pinned 布局中 seg_lens 与 counts 同义(均为 accepted),
+            # 旧公式恒为 1,已废弃。
+            _denom = len(req_ids) * self._lwd_spec_k
+            if _denom:
                 self._lwd_engine_stats.add_gauge(
-                    "g:acc", sum(counts) / _rows)
+                    "g:acc", sum(counts) / _denom)
                 self._lwd_engine_stats.add_gauge("g:reqs", len(req_ids))
             _t = time.monotonic()
             # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
