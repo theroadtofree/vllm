@@ -78,16 +78,30 @@ class _LwdEngineStats:
             if seconds > seg[2]:
                 seg[2] = seconds
 
+    def add_gauge(self, name: str, value: float) -> None:
+        """非耗时计量(如每步调度 token 数):avg/max 输出。"""
+        with self._lock:
+            seg = self._segs.setdefault(name, [0, 0.0, 0.0])
+            seg[0] += 1
+            seg[1] += value
+            if value > seg[2]:
+                seg[2] = value
+
     def flush(self) -> None:
         with self._lock:
             now = time.monotonic()
             parts = []
             for name, (n, total, mx) in self._segs.items():
                 if n:
-                    parts.append(
-                        f"{name}: n={n} avg={total / n * 1000:.2f}ms "
-                        f"max={mx * 1000:.2f}ms"
-                    )
+                    if name.startswith("g:"):
+                        parts.append(
+                            f"{name[2:]}: n={n} avg={total / n:.0f} max={mx:.0f}"
+                        )
+                    else:
+                        parts.append(
+                            f"{name}: n={n} avg={total / n * 1000:.2f}ms "
+                            f"max={mx * 1000:.2f}ms"
+                        )
             self._segs.clear()
             window = now - self._flushed_at
             self._flushed_at = now
@@ -124,6 +138,38 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         self._lwd_engine_stats = _LwdEngineStats()
         super().__init__(*args, **kwargs)
+        self._lwd_wrap_step_internals()
+
+    def _lwd_wrap_step_internals(self) -> None:
+        """step 内部聚合拆分(与 smc_verbs 基线树同款,用于跨数据面对比):
+        sched=scheduler.schedule()(组批+UP seqno 快照);model_sub=
+        execute_model/sample_tokens 的引擎侧提交(non_block,不含 NPU
+        计算);g:tok=每步调度 token 数。step_exec−sched−model_sub≈
+        阻塞等 worker 结果的时长(NPU 计算/worker 内通信)。"""
+        stats = self._lwd_engine_stats
+
+        orig_schedule = self.scheduler.schedule
+
+        def timed_schedule(*args, **kwargs):
+            t0 = time.monotonic()
+            so = orig_schedule(*args, **kwargs)
+            stats.add("sched", time.monotonic() - t0)
+            stats.add_gauge("g:tok", so.total_num_scheduled_tokens)
+            return so
+
+        self.scheduler.schedule = timed_schedule  # type: ignore[method-assign]
+
+        executor = self.model_executor
+        for attr in ("execute_model", "sample_tokens"):
+            orig = getattr(executor, attr)
+
+            def timed_submit(*args, _orig=orig, **kwargs):
+                t0 = time.monotonic()
+                result = _orig(*args, **kwargs)
+                stats.add("model_sub", time.monotonic() - t0)
+                return result
+
+            setattr(executor, attr, timed_submit)
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
