@@ -503,14 +503,15 @@ class LwdCloudEngineCore(EngineCoreProc):
                 meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
-            # MTP 接受率直接计量:Σaccepted / (请求数 × 投机步数 k)。
-            # 实测 pinned 布局中 seg_lens 与 counts 同义(均为 accepted),
-            # 旧公式恒为 1,已废弃。
-            _denom = len(req_ids) * self._lwd_spec_k
-            if _denom:
-                self._lwd_engine_stats.add_gauge(
-                    "g:acc", sum(counts) / _denom)
-                self._lwd_engine_stats.add_gauge("g:reqs", len(req_ids))
+            # MTP 接受率计量:逐请求记录 accepted(counts)与段长
+            # (seg_lens)的分布(avg/max/n),不猜比值公式——counts 与
+            # seg_lens 的真实语义由两个分布一次定清:若 counts 恒等于
+            # seg_lens(全接受),则接受率确实为 100%,吞吐差异在别处。
+            for _c in counts:
+                self._lwd_engine_stats.add_gauge("g:cnt", _c)
+            for _s in seg_lens:
+                self._lwd_engine_stats.add_gauge("g:seg", _s)
+            self._lwd_engine_stats.add_gauge("g:reqs", len(req_ids))
             _t = time.monotonic()
             # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
             # 把本步逐请求 accepted token ids 捎带给边侧直接交付。
