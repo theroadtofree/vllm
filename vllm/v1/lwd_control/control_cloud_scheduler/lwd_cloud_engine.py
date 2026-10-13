@@ -500,6 +500,12 @@ class LwdCloudEngineCore(EngineCoreProc):
                 meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
+            # MTP 接受率直接计量:Σaccepted / Σ行(行=accepted+1/请求)
+            _rows = sum(seg_lens)
+            if _rows:
+                self._lwd_engine_stats.add_gauge(
+                    "g:acc", sum(counts) / _rows)
+                self._lwd_engine_stats.add_gauge("g:reqs", len(req_ids))
             _t = time.monotonic()
             # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
             # 把本步逐请求 accepted token ids 捎带给边侧直接交付。
