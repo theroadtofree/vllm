@@ -35,7 +35,7 @@ LWD_DATA_PLANE_PORT_DEFAULT = LWD_POST_OUT_PORT_DEFAULT + 1
 # 等云首拍 HELLO 的预算:HELLO 在云引擎全量初始化(权重/KV/图编译
 # capture)完成后才发出,预算须覆盖云的全量启动时长(边不开图、
 # 云开图是本场景固定形态),默认 600s;部署可经 hello_timeout_s/env 覆盖
-LWD_HELLO_TIMEOUT_S_DEFAULT = 600.0
+LWD_HELLO_TIMEOUT_S_DEFAULT = 1200.0
 
 _LWD_CONFIG_SECTION = "lwd_config"
 # 传输层字段(pre_out_host 等)的历史段名;仅作兼容回退
