@@ -223,9 +223,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         len(self._lwd_batch_requests),
                         "; ".join(
                             f"seqno={sn}: "
-                            f"waiting={[r for r in rids
-                                       if r not in
-                                       self._lwd_first_token_seen]}"
+                            f"waiting={[r for r in rids if r not in self._lwd_first_token_seen]}"
                             for sn, rids in
                             self._lwd_batch_requests.items()),
                     )
