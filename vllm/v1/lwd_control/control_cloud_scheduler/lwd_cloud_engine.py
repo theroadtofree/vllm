@@ -57,65 +57,6 @@ def _lwd_diag_token_passthrough_enabled() -> bool:
             or os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_DOWN_RECV") == "1")
 
 
-class _LwdEngineStats:
-    """云引擎主循环分段聚合(error 级、5s 一条,不逐步打印):
-    step_exec=步执行(调度+计算);down_tax=每步 DOWN 侧 LWD 税
-    (carrier 解码+pinned tolist+c2e publish);preout=PRE_OUT 消息
-    分派(chunk 接纳)。线程间计数,锁保护。"""
-
-    def __init__(self) -> None:
-        import threading
-
-        self._lock = threading.Lock()
-        self._segs: dict[str, list] = {}  # name -> [n, total_s, max_s]
-        self._flushed_at = time.monotonic()
-
-    def add(self, name: str, seconds: float) -> None:
-        with self._lock:
-            seg = self._segs.setdefault(name, [0, 0.0, 0.0])
-            seg[0] += 1
-            seg[1] += seconds
-            if seconds > seg[2]:
-                seg[2] = seconds
-
-    def add_gauge(self, name: str, value: float) -> None:
-        """非耗时计量(如每步调度 token 数):avg/max 输出。"""
-        with self._lock:
-            seg = self._segs.setdefault(name, [0, 0.0, 0.0])
-            seg[0] += 1
-            seg[1] += value
-            if value > seg[2]:
-                seg[2] = value
-
-    def flush(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            parts = []
-            for name, (n, total, mx) in self._segs.items():
-                if n:
-                    if name.startswith("g:"):
-                        parts.append(
-                            f"{name[2:]}: n={n} avg={total / n:.0f} max={mx:.0f}"
-                        )
-                    else:
-                        parts.append(
-                            f"{name}: n={n} avg={total / n * 1000:.2f}ms "
-                            f"max={mx * 1000:.2f}ms"
-                        )
-            self._segs.clear()
-            window = now - self._flushed_at
-            self._flushed_at = now
-        if parts:
-            logger.warning("[Lwd][stats] cloud-engine %.0fs: %s", window,
-                         "; ".join(parts))
-
-# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
-LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
-
-# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
-_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
-
-
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
 
@@ -136,43 +77,11 @@ class LwdCloudEngineCore(EngineCoreProc):
             if scheduler_name in ("prefill_first", "decode_first")
             else LwdCloudMixedScheduler
         )
-        self._lwd_engine_stats = _LwdEngineStats()
         _spec = getattr(vllm_config.speculative_config,
                         "num_speculative_tokens", None) or 0
         self._lwd_spec_k = int(_spec)
         super().__init__(*args, **kwargs)
-        self._lwd_wrap_step_internals()
 
-    def _lwd_wrap_step_internals(self) -> None:
-        """step 内部聚合拆分(与 smc_verbs 基线树同款,用于跨数据面对比):
-        sched=scheduler.schedule()(组批+UP seqno 快照);model_sub=
-        execute_model/sample_tokens 的引擎侧提交(non_block,不含 NPU
-        计算);g:tok=每步调度 token 数。step_exec−sched−model_sub≈
-        阻塞等 worker 结果的时长(NPU 计算/worker 内通信)。"""
-        stats = self._lwd_engine_stats
-
-        orig_schedule = self.scheduler.schedule
-
-        def timed_schedule(*args, **kwargs):
-            t0 = time.monotonic()
-            so = orig_schedule(*args, **kwargs)
-            stats.add("sched", time.monotonic() - t0)
-            stats.add_gauge("g:tok", so.total_num_scheduled_tokens)
-            return so
-
-        self.scheduler.schedule = timed_schedule  # type: ignore[method-assign]
-
-        executor = self.model_executor
-        for attr in ("execute_model", "sample_tokens"):
-            orig = getattr(executor, attr)
-
-            def timed_submit(*args, _orig=orig, **kwargs):
-                t0 = time.monotonic()
-                result = _orig(*args, **kwargs)
-                stats.add("model_sub", time.monotonic() - t0)
-                return result
-
-            setattr(executor, attr, timed_submit)
 
     def _lwd_setup_zmq(self) -> None:
         """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
@@ -250,7 +159,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         while True:
             msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
             # 分段聚合冲刷拍:recv 超时 5s 一拍,引擎空转也保证 stats 输出
-            self._lwd_engine_stats.flush()
             if msg is None:
                 # seqno tracker 也定期检查:长时间无新到达时 flush 状态
                 import time as _t
@@ -272,7 +180,6 @@ class LwdCloudEngineCore(EngineCoreProc):
                 continue
             _t0 = time.monotonic()
             self._lwd_dispatch(msg)
-            self._lwd_engine_stats.add("preout", time.monotonic() - _t0)
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
@@ -309,7 +216,6 @@ class LwdCloudEngineCore(EngineCoreProc):
                 )
                 if not seqnos or msg.seqno > seqnos[-1]:
                     seqnos.append(msg.seqno)
-                    self._lwd_seq_track("recv", msg.seqno)
             logger.warning(
                 "[Lwd][cloud-ctrl] RangeNotify reqs=%d num=%s seqno=%s",
                 len(items), sum(item.num_tokens for item in items),
@@ -458,7 +364,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
         _t0 = time.monotonic()
         out = super().step_with_batch_queue()
-        self._lwd_engine_stats.add("step_exec", time.monotonic() - _t0)
         logger.info(
             "[Lwd][perf] cloud-step exec=%.2fms",
             (time.monotonic() - _t0) * 1000,
@@ -469,7 +374,6 @@ class LwdCloudEngineCore(EngineCoreProc):
         """同步步路径同款打点。"""
         _t0 = time.monotonic()
         out = super().step()
-        self._lwd_engine_stats.add("step_exec", time.monotonic() - _t0)
         logger.info(
             "[Lwd][perf] cloud-step exec=%.2fms",
             (time.monotonic() - _t0) * 1000,
@@ -519,15 +423,6 @@ class LwdCloudEngineCore(EngineCoreProc):
                 meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
-            # MTP 接受率计量:逐请求记录 accepted(counts)与段长
-            # (seg_lens)的分布(avg/max/n),不猜比值公式——counts 与
-            # seg_lens 的真实语义由两个分布一次定清:若 counts 恒等于
-            # seg_lens(全接受),则接受率确实为 100%,吞吐差异在别处。
-            for _c in counts:
-                self._lwd_engine_stats.add_gauge("g:cnt", _c)
-            for _s in seg_lens:
-                self._lwd_engine_stats.add_gauge("g:seg", _s)
-            self._lwd_engine_stats.add_gauge("g:reqs", len(req_ids))
             _t = time.monotonic()
             # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
             # 把本步逐请求 accepted token ids 捎带给边侧直接交付。
@@ -540,7 +435,6 @@ class LwdCloudEngineCore(EngineCoreProc):
                 self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
                 token_ids,
             )
-            self._lwd_engine_stats.add("down_tax", time.monotonic() - _tax_t0)
             # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
             logger.info(
                 "[Lwd][perf] publish reqs=%d dur=%.2fms",
@@ -610,34 +504,6 @@ class LwdCloudEngineCore(EngineCoreProc):
                 ids_by_req[out.request_id] = list(out.new_token_ids)
         return ids_by_req
 
-    def _lwd_seq_track(self, action: str, seqno: int) -> None:
-        """seqno 追踪聚合(30s 一条 error):与边侧同款对拍。"""
-        import time as _time
-        _now = _time.monotonic()
-        _t = getattr(self, "_seq_trace", None)
-        if _t is None:
-            _t = self._seq_trace = {
-                "last_flush": _now, "min": seqno, "max": seqno,
-                "seen": {seqno}, "action": action,
-            }
-            return
-        _t["min"] = min(_t["min"], seqno)
-        _t["max"] = max(_t["max"], seqno)
-        _t["seen"].add(seqno)
-        if _now - _t["last_flush"] >= 30.0 and len(_t["seen"]) > 1:
-            _full = set(range(_t["min"], _t["max"] + 1))
-            _holes = sorted(_full - _t["seen"])
-            logger.error(
-                "[Lwd][seqno] cloud %s %d..%d (%d announcements)"
-                "%s",
-                _t["action"], _t["min"], _t["max"],
-                len(_t["seen"]),
-                f" HOLES={_holes}" if _holes else " (continuous)",
-            )
-            self._seq_trace = {
-                "last_flush": _now, "min": seqno, "max": seqno,
-                "seen": {seqno}, "action": action,
-            }
 
     def _lwd_publish_c2e(
         self,

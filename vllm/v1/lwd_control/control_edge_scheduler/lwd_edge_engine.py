@@ -63,57 +63,6 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 logger = init_logger(__name__)
 
 
-class _LwdEdgeStats:
-    """边引擎分段聚合(error 级、5s 一条,不逐步打印):
-    e_step=边引擎步全程(收割+派发);c2e_wait=c2e 通告到达→UNEMBED
-    派发(消费滞后);g:c2epend=c2e 队列水位。两树同款对比用。"""
-
-    def __init__(self) -> None:
-        import threading
-        self._lock = threading.Lock()
-        self._segs = {}
-        self._flushed_at = time.monotonic()
-
-    def add(self, name, seconds):
-        with self._lock:
-            seg = self._segs.setdefault(name, [0, 0.0, 0.0])
-            seg[0] += 1; seg[1] += seconds
-            if seconds > seg[2]: seg[2] = seconds
-
-    def add_gauge(self, name, value):
-        with self._lock:
-            seg = self._segs.setdefault(name, [0, 0.0, 0.0])
-            seg[0] += 1; seg[1] += value
-            if value > seg[2]: seg[2] = value
-
-    def maybe_flush(self):
-        now = time.monotonic()
-        if now - self._flushed_at < 5.0:
-            return
-        with self._lock:
-            parts = []
-            for n, (c, t, m) in self._segs.items():
-                if not c:
-                    continue
-                if n.startswith("g:"):
-                    parts.append(f"{n[2:]}: n={c} avg={t/c:.1f} max={m:.0f}")
-                else:
-                    parts.append(f"{n}: n={c} avg={t/c*1000:.2f}ms max={m*1000:.2f}ms")
-            self._segs.clear()
-            window = now - self._flushed_at
-            self._flushed_at = now
-        if parts:
-            logger.warning("[Lwd][stats] edge-engine %.0fs: %s", window, "; ".join(parts))
-
-
-_LWD_EDGE_STATS = _LwdEdgeStats()
-
-
-def _lwd_disable_down_enabled() -> bool:
-    """VLLM_ASCEND_LWD_DISABLE_DOWN=1:云不 collect/不发 DOWN,边直通交付。"""
-    return os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
-
-
 # 云->边载荷队列容量:队满时接收线程阻塞在 put,背压沿 ZMQ 直达云侧
 # 步发送循环(载荷不可丢)
 LWD_C2E_META_QUEUE_MAX = 1000
@@ -203,7 +152,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         publisher = self._edge_sender
         while not receiver.closed:
             msg = receiver.recv(timeout_ms=5000)
-            _LWD_EDGE_STATS.maybe_flush()
             if msg is None:
                 continue
             if isinstance(msg, LwdHelloNotify):
@@ -343,13 +291,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def step(self):
         _t0 = time.monotonic()
         out = self._lwd_edge_step()
-        _LWD_EDGE_STATS.add("e_step", time.monotonic() - _t0)
         return out
 
     def step_with_batch_queue(self):
         _t0 = time.monotonic()
         out = self._lwd_edge_step()
-        _LWD_EDGE_STATS.add("e_step", time.monotonic() - _t0)
         return out
 
     def has_work(self) -> bool:
@@ -495,42 +441,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
             scheduler_output.total_num_scheduled_tokens,
             n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
         )
-        self._lwd_seq_track("sent", batch.seqno)
         return self.model_executor.execute_model(
             scheduler_output, non_block=True
         )
 
-    def _lwd_seq_track(self, action: str, seqno: int) -> None:
-        """seqno 追踪聚合(30s 一条 error):dispatched 区间 + 空洞检测。
-        正常连续时输出一行确认;出现空洞时 holes=[..] 直接可见——
-        与云侧同款对拍,定位"边发了但云没收到"或"边没发"。"""
-        import time as _time
-        _now = _time.monotonic()
-        _t = getattr(self, "_seq_trace", None)
-        if _t is None:
-            _t = self._seq_trace = {
-                "last_flush": _now, "min": seqno, "max": seqno,
-                "seen": {seqno}, "action": action,
-            }
-            return
-        _t["min"] = min(_t["min"], seqno)
-        _t["max"] = max(_t["max"], seqno)
-        _t["seen"].add(seqno)
-        if _now - _t["last_flush"] >= 30.0:
-            _full = set(range(_t["min"], _t["max"] + 1))
-            _holes = sorted(_full - _t["seen"])
-            logger.error(
-                "[Lwd][seqno] edge %s %d..%d (%d batches, %d in window)"
-                "%s",
-                _t["action"], _t["min"], _t["max"],
-                len(_t["seen"]),
-                len(_t["seen"]),
-                f" HOLES={_holes}" if _holes else " (continuous)",
-            )
-            self._seq_trace = {
-                "last_flush": _now, "min": seqno, "max": seqno,
-                "seen": {seqno}, "action": action,
-            }
 
     def _lwd_dispatch_unembed(self, notify: LwdC2eNotify, t_arrive: float):
         """UNEMBED 批提交侧:组批并以 non_block 提交 worker,立即返回
@@ -541,8 +455,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         c2e_wait(到达→派发)是消费滞后读数:持续偏大说明边引擎步
         循环被收割/派发占住,c2e 在积压,云侧 publisher 队满小睡在即。"""
         unembed_batch = lwd_build_unembed_batch(notify)
-        _LWD_EDGE_STATS.add("c2e_wait", time.monotonic() - t_arrive)
-        _LWD_EDGE_STATS.add_gauge("g:c2epend", self.lwd_c2e_meta_queue.qsize())
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
             "[Lwd][sched] edge dispatch-unembed seqno=%s reqs=%d rows=%d "
