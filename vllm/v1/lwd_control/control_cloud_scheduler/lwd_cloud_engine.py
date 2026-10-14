@@ -106,7 +106,7 @@ class _LwdEngineStats:
             window = now - self._flushed_at
             self._flushed_at = now
         if parts:
-            logger.error("[Lwd][stats] cloud-engine %.0fs: %s", window,
+            logger.warning("[Lwd][stats] cloud-engine %.0fs: %s", window,
                          "; ".join(parts))
 
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
@@ -294,7 +294,8 @@ class LwdCloudEngineCore(EngineCoreProc):
                 )
                 if not seqnos or msg.seqno > seqnos[-1]:
                     seqnos.append(msg.seqno)
-            logger.info(
+                    self._lwd_seq_track("recv", msg.seqno)
+            logger.warning(
                 "[Lwd][cloud-ctrl] RangeNotify reqs=%d num=%s seqno=%s",
                 len(items), sum(item.num_tokens for item in items),
                 msg.seqno,
@@ -305,7 +306,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
-            logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
+            logger.error("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             self._lwd_seqno_registry.pop(msg.request_id, None)
             # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
@@ -357,7 +358,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 removed += 1
         if removed:
             self.scheduler.prefill_notify_queue = kept
-            logger.info(
+            logger.error(
                 "[Lwd][cloud-ctrl] purged %d pending notify item(s) for "
                 "aborted req=%s", removed, request_id,
             )
@@ -593,6 +594,35 @@ class LwdCloudEngineCore(EngineCoreProc):
             for out in outputs.outputs:
                 ids_by_req[out.request_id] = list(out.new_token_ids)
         return ids_by_req
+
+    def _lwd_seq_track(self, action: str, seqno: int) -> None:
+        """seqno 追踪聚合(30s 一条 error):与边侧同款对拍。"""
+        import time as _time
+        _now = _time.monotonic()
+        _t = getattr(self, "_seq_trace", None)
+        if _t is None:
+            _t = self._seq_trace = {
+                "last_flush": _now, "min": seqno, "max": seqno,
+                "seen": {seqno}, "action": action,
+            }
+            return
+        _t["min"] = min(_t["min"], seqno)
+        _t["max"] = max(_t["max"], seqno)
+        _t["seen"].add(seqno)
+        if _now - _t["last_flush"] >= 30.0:
+            _full = set(range(_t["min"], _t["max"] + 1))
+            _holes = sorted(_full - _t["seen"])
+            logger.error(
+                "[Lwd][seqno] cloud %s %d..%d (%d announcements)"
+                "%s",
+                _t["action"], _t["min"], _t["max"],
+                len(_t["seen"]),
+                f" HOLES={_holes}" if _holes else " (continuous)",
+            )
+            self._seq_trace = {
+                "last_flush": _now, "min": seqno, "max": seqno,
+                "seen": {seqno}, "action": action,
+            }
 
     def _lwd_publish_c2e(
         self,

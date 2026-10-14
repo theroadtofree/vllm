@@ -103,7 +103,7 @@ class _LwdEdgeStats:
             window = now - self._flushed_at
             self._flushed_at = now
         if parts:
-            logger.error("[Lwd][stats] edge-engine %.0fs: %s", window, "; ".join(parts))
+            logger.warning("[Lwd][stats] edge-engine %.0fs: %s", window, "; ".join(parts))
 
 
 _LWD_EDGE_STATS = _LwdEdgeStats()
@@ -480,19 +480,57 @@ class LwdEdgeEngineCore(EngineCoreProc):
         已按排程乐观推进,该 chunk 随 SO 废弃即永久丢失(进度虚高),
         正确性由通道不丢保证;同步/异步失败语义镜像(均为弃批)。"""
         if not self.scheduler.lwd_edge_notify(scheduler_output):
+            logger.warning(
+                "[Lwd][sched] edge dispatch-embed FAILED seqno=%d reqs=%s "
+                "— 通告发布失败,本批永久丢失(云侧将等待超时)",
+                batch.seqno, batch.batch_meta.req_ids,
+            )
             return None
         batch = scheduler_output.lwd_batch
         n_emb, n_unemb = self._lwd_queue_mix()
-        logger.info(
+        logger.warning(
             "[Lwd][sched] edge dispatch-embed seqno=%d reqs=%s tokens=%d "
             "ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
             batch.seqno, batch.batch_meta.req_ids,
             scheduler_output.total_num_scheduled_tokens,
             n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
         )
+        self._lwd_seq_track("sent", batch.seqno)
         return self.model_executor.execute_model(
             scheduler_output, non_block=True
         )
+
+    def _lwd_seq_track(self, action: str, seqno: int) -> None:
+        """seqno 追踪聚合(30s 一条 error):dispatched 区间 + 空洞检测。
+        正常连续时输出一行确认;出现空洞时 holes=[..] 直接可见——
+        与云侧同款对拍,定位"边发了但云没收到"或"边没发"。"""
+        import time as _time
+        _now = _time.monotonic()
+        _t = getattr(self, "_seq_trace", None)
+        if _t is None:
+            _t = self._seq_trace = {
+                "last_flush": _now, "min": seqno, "max": seqno,
+                "seen": {seqno}, "action": action,
+            }
+            return
+        _t["min"] = min(_t["min"], seqno)
+        _t["max"] = max(_t["max"], seqno)
+        _t["seen"].add(seqno)
+        if _now - _t["last_flush"] >= 30.0:
+            _full = set(range(_t["min"], _t["max"] + 1))
+            _holes = sorted(_full - _t["seen"])
+            logger.error(
+                "[Lwd][seqno] edge %s %d..%d (%d batches, %d in window)"
+                "%s",
+                _t["action"], _t["min"], _t["max"],
+                len(_t["seen"]),
+                len(_t["seen"]),
+                f" HOLES={_holes}" if _holes else " (continuous)",
+            )
+            self._seq_trace = {
+                "last_flush": _now, "min": seqno, "max": seqno,
+                "seen": {seqno}, "action": action,
+            }
 
     def _lwd_dispatch_unembed(self, notify: LwdC2eNotify, t_arrive: float):
         """UNEMBED 批提交侧:组批并以 non_block 提交 worker,立即返回
