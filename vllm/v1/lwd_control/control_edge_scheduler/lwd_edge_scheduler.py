@@ -166,10 +166,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             < 1
         ):
             raise RuntimeError(
-                f"[LWD] 死锁配置: max_num_batched_tokens("
+                f"[LWD] deadlock config: max_num_batched_tokens("
                 f"{self.max_num_scheduled_tokens}) - max_num_seqs("
                 f"{self.max_num_running_reqs}) * spec_factor("
-                f"{self._lwd_spec_factor}) < 1, 续传 chunk 永无可调度预算; "
+                f"{self._lwd_spec_factor}) < 1, no schedulable budget; "
                 "请增大 max_num_batched_tokens 或减小 max_num_seqs"
             )
 
@@ -198,15 +198,38 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
                 if not self._lwd_prefill_gate_held:
                     self._lwd_prefill_gate_held = True
-                    logger.info(
+                    seen = self._lwd_first_token_seen
+                    _detail = "; ".join(
+                        f"seqno={sn}: "
+                        f"waiting={[r for r in rids if r not in seen]}"
+                        for sn, rids in self._lwd_batch_requests.items()
+                    )
+                    logger.error(
                         "[Lwd][edge-sched] prefill gate HOLD: "
-                        "pending_chunks=%d >= %d",
+                        "pending_chunks=%d >= %d detail=[%s]",
                         pending_chunks, _LWD_MAX_PENDING_CHUNKS,
+                        _detail,
                     )
                 return SchedulerOutput.make_empty()
             if self._lwd_prefill_gate_held:
                 self._lwd_prefill_gate_held = False
-                logger.info(
+                import time as _t
+                _now = _t.monotonic()
+                if _now - getattr(self, "_last_gate_log", 0) >= 60.0:
+                    self._last_gate_log = _now
+                    logger.error(
+                        "[Lwd][edge-sched] gate still held: "
+                        "pending=%d detail=[%s]",
+                        len(self._lwd_batch_requests),
+                        "; ".join(
+                            f"seqno={sn}: "
+                            f"waiting={[r for r in rids
+                                       if r not in
+                                       self._lwd_first_token_seen]}"
+                            for sn, rids in
+                            self._lwd_batch_requests.items()),
+                    )
+                logger.error(
                     "[Lwd][edge-sched] prefill gate OPEN: pending_chunks=%d",
                     pending_chunks,
                 )
@@ -371,7 +394,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 raise RuntimeError(
                     f"[Lwd][edge-sched] chunk schedule mismatch: "
                     f"req={req_id} scheduled={got} != expected={want} "
-                    f"(cap/threshold 失守或原生行为发散)"
+                    f"(cap/threshold breach or native behavior divergence)"
                 )
         return out
 

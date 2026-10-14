@@ -296,8 +296,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"[LWD] edge/cloud scheduling config mismatch: "
                 f"(max_num_batched_tokens, max_num_seqs) "
                 f"edge={local[:2]} != cloud={remote[:2]}; "
-                f"cap/preflight 公式两侧同源输入不一致会让 preflight 恒 "
-                f"hold、prefill 被 decode 静默串行——两侧拉起配置须同值"
+                f"cap/preflight formula mismatch will hold prefill "
+                f"silent forever; both sides must use same config"
             )
         if local[2] != remote[2]:
             # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
@@ -317,11 +317,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
             ):
                 self._lwd_shutdown_planes()
                 raise RuntimeError(
-                    f"[LWD] 死锁配置: 采纳云侧 spec_factor={remote[2] + 1} "
-                    f"后 cap 恒 < 1(预算 {self.scheduler.max_num_scheduled_tokens}"
-                    f" − 满员 {self.scheduler.max_num_running_reqs} × "
-                    f"{remote[2] + 1});请增大 max_num_batched_tokens "
-                    f"或减小 max_num_seqs"
+                    f"[LWD] deadlock config: adopting cloud spec_factor={remote[2]+1} "
+                    f" makes cap < 1 (budget {self.scheduler.max_num_scheduled_tokens}"
+                    f" - full {self.scheduler.max_num_running_reqs} * "
+                    f"{remote[2]+1}); increase max_num_batched_tokens "
+                    f"or decrease max_num_seqs"
                 )
         logger.info("[Lwd] HELLO scheduling triple verified: %s", local)
 

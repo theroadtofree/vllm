@@ -327,7 +327,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"req={item.request_id} seqno={notify.seqno}: "
                     f"notify offset={item.offset} != cloud computed="
                     f"{request.num_computed_tokens} "
-                    f"(chunk 断流/重复/乱序)"
+                    f"(chunk gap/dup/reorder)"
                 )
         req_ids = decode_ids + [item.request_id for item in items]
         # decode 精确消耗:预算钳制的精确性依赖逐字复刻原生 running 段

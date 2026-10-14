@@ -252,6 +252,21 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 分段聚合冲刷拍:recv 超时 5s 一拍,引擎空转也保证 stats 输出
             self._lwd_engine_stats.flush()
             if msg is None:
+                # seqno tracker 也定期检查:长时间无新到达时 flush 状态
+                import time as _t
+                _st = getattr(self, "_seq_trace", None)
+                if _st and _t.monotonic() - _st["last_flush"] >= 60.0:
+                    _full = set(range(_st["min"], _st["max"] + 1))
+                    _holes = sorted(_full - _st["seen"])
+                    logger.error(
+                        "[Lwd][seqno] cloud %s STALLED at %d..%d "
+                        "(%d seen, last flush %.0fs ago)%s",
+                        _st["action"], _st["min"], _st["max"],
+                        len(_st["seen"]),
+                        _t.monotonic() - _st["last_flush"],
+                        f" HOLES={_holes}" if _holes else "",
+                    )
+                    _st["last_flush"] = _t.monotonic()
                 if self._lwd_subscriber.closed:
                     break
                 continue
@@ -609,7 +624,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         _t["min"] = min(_t["min"], seqno)
         _t["max"] = max(_t["max"], seqno)
         _t["seen"].add(seqno)
-        if _now - _t["last_flush"] >= 30.0:
+        if _now - _t["last_flush"] >= 30.0 and len(_t["seen"]) > 1:
             _full = set(range(_t["min"], _t["max"] + 1))
             _holes = sorted(_full - _t["seen"])
             logger.error(
