@@ -1033,11 +1033,6 @@ class WorkerProc:
         if ready_event is not None:
             _t_sync = time.monotonic()
             ready_event.synchronize()
-            # npu Event 不可 pickle:同步完即从输出上摘除——响应经
-            # response_mq(共享内存 pickle)发给引擎,带上它必炸
-            # "cannot pickle 'Event' object"(单请求即复现)。event 是
-            # 一次性围栏,同步后无消费者,摘除即语义闭合。
-            del output.lwd_meta_event
             # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
             # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
             # 健康值 ≈ get_output 之后的主流残量;若接近整步时长,
