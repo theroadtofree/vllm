@@ -63,6 +63,11 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 logger = init_logger(__name__)
 
 
+def _lwd_disable_down_enabled() -> bool:
+    """VLLM_ASCEND_LWD_DISABLE_DOWN=1:云不 collect/不发 DOWN,边直通交付。"""
+    return os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
+
+
 # 云->边载荷队列容量:队满时接收线程阻塞在 put,背压沿 ZMQ 直达云侧
 # 步发送循环(载荷不可丢)
 LWD_C2E_META_QUEUE_MAX = 1000
