@@ -1017,23 +1017,30 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        if isinstance(output, AsyncModelRunnerOutput):
+            output = output.get_output()
+
         # LWD: sample_tokens 的采集在主流末尾异步物化 pinned meta,
         # 发送响应前必须等其落地(此处是输出线程/同步路径的入队点,
         # 非计算关键路径),保证控制面读到的 meta 是完整的。
-        # 事件由 runner 每步覆写;到期事件 synchronize 为 no-op,无需清理。
-        ready_event = getattr(self.worker, "_lwd_meta_ready_event", None)
+        # 就绪事件是随本输出携带的每步私有 event(lwd_meta_event,
+        # get_output 解包后在内层 ModelRunnerOutput 上)——不能用
+        # 每步覆写的 worker 属性:verbs wire 下计算线程全异步,可能
+        # 领先输出线程 ≥1 步,覆写属性会把本输出的同步拖到后步
+        # event 上,响应被整步多压(HCCL wire 的 handle.wait 把计算
+        # 线程按在设备后面,该竞态不触发)。
+        ready_event = getattr(output, "lwd_meta_event", None)
         if ready_event is not None:
             _t_sync = time.monotonic()
             ready_event.synchronize()
             # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
             # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
+            # 健康值 ≈ get_output 之后的主流残量;若接近整步时长,
+            # 说明出现了跨步过等(旧 worker 属性方案的症状)。
             logger.info(
                 "[Lwd][perf] ready-event-sync dur=%.2fms ts=%.3f",
                 (time.monotonic() - _t_sync) * 1000, time.monotonic(),
             )
-
-        if isinstance(output, AsyncModelRunnerOutput):
-            output = output.get_output()
 
         if getattr(output, "lwd_c2e_meta", None) is not None:
             logger.info(
