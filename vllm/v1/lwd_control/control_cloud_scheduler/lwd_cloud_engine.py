@@ -56,6 +56,12 @@ def _lwd_diag_token_passthrough_enabled() -> bool:
             or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
             or os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_DOWN_RECV") == "1")
 
+# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
+LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
+
+# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
+_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
+
 
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
