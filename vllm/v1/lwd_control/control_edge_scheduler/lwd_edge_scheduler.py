@@ -198,39 +198,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
                 if not self._lwd_prefill_gate_held:
                     self._lwd_prefill_gate_held = True
-                    seen = self._lwd_first_token_seen
-                    _detail = "; ".join(
-                        f"seqno={sn}: "
-                        f"waiting={[r for r in rids if r not in seen]}"
-                        for sn, rids in self._lwd_batch_requests.items()
-                    )
-                    logger.error(
+                    logger.info(
                         "[Lwd][edge-sched] prefill gate HOLD: "
-                        "pending_chunks=%d >= %d detail=[%s]",
+                        "pending_chunks=%d >= %d",
                         pending_chunks, _LWD_MAX_PENDING_CHUNKS,
-                        _detail,
                     )
                 return SchedulerOutput.make_empty()
             if self._lwd_prefill_gate_held:
                 self._lwd_prefill_gate_held = False
-                import time as _t
-                _now = _t.monotonic()
-                if _now - getattr(self, "_last_gate_log", 0) >= 60.0:
-                    self._last_gate_log = _now
-                    logger.error(
-                        "[Lwd][edge-sched] gate still held: "
-                        "pending=%d detail=[%s]",
-                        len(self._lwd_batch_requests),
-                        "; ".join(
-                            f"seqno={sn}: "
-                            f"waiting={[r for r in rids if r not in self._lwd_first_token_seen]}"
-                            for sn, rids in
-                            self._lwd_batch_requests.items()),
-                    )
-                logger.error(
+                logger.info(
                     "[Lwd][edge-sched] prefill gate OPEN: pending_chunks=%d",
                     pending_chunks,
                 )
+
         return self._lwd_schedule_batch()
 
     def _lwd_pick_prefill_batch(
