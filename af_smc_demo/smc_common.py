@@ -101,6 +101,19 @@ def _set_big_buffers(sock: socket.socket, mb: int = BUF_MB) -> None:
     nbytes = mb * 1024 * 1024
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, nbytes)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, nbytes)
+    # 读回实测:超 rmem_max/wmem_max 的截断是静默的,而显式 setsockopt
+    # 会关闭 TCP 接收窗口自动调窗——截断即把窗口钉死在小值,单流上限
+    # ≈ 窗口/RTT(getsockopt 返回值内核已翻倍,低于请求值必为截断)。
+    for opt, name in (
+        (socket.SO_SNDBUF, "SNDBUF"),
+        (socket.SO_RCVBUF, "RCVBUF"),
+    ):
+        actual = sock.getsockopt(socket.SOL_SOCKET, opt)
+        if actual < nbytes:
+            print(f"[warn] {name} actual {actual // 1024}KiB < requested "
+                  f"{nbytes // 1024}KiB (capped by net.core.rmem_max/"
+                  f"wmem_max): fix on BOTH hosts and retry — sysctl -w "
+                  f"net.core.rmem_max=16777216 net.core.wmem_max=16777216")
 
 
 def open_socket(family: str) -> socket.socket:
@@ -187,8 +200,22 @@ def accept_socket(srv: socket.socket, family: str) -> tuple[socket.socket, tuple
 
 
 def send_frame(sock: socket.socket, seqno: int, payload: bytes, aux: bytes = b"") -> None:
-    """发送一帧:定长头 + payload + aux(单次 sendall,大帧由内核分片)。"""
-    sock.sendall(HEADER.pack(MAGIC, seqno, len(payload), len(aux)) + payload + aux)
+    """发送一帧:定长头 + payload + aux。优先 socket.sendmsg 聚集写出
+    (一次 syscall,语义同 writev;TCP_NODELAY 下 28B 头不独立成小段,
+    也省去头+载荷的拼接拷贝),部分写时按剩余视图重发;平台无 sendmsg
+    时回退 sendall 拼接。"""
+    header = HEADER.pack(MAGIC, seqno, len(payload), len(aux))
+    if hasattr(sock, "sendmsg"):
+        views = [memoryview(p) for p in (header, payload, aux) if len(p)]
+        while views:
+            sent = sock.sendmsg(views)
+            while views and sent >= len(views[0]):
+                sent -= len(views[0])
+                views.pop(0)
+            if sent and views:
+                views[0] = views[0][sent:]
+    else:
+        sock.sendall(header + payload + aux)
 
 
 def recv_exactly(sock: socket.socket, n: int) -> bytes:

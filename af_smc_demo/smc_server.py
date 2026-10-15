@@ -21,6 +21,7 @@ import zlib
 
 from smc_common import (
     FrameStats,
+    _set_big_buffers,
     accept_socket,
     bind_socket,
     now,
@@ -57,6 +58,15 @@ def main() -> int:
     # AF_SMC socket 的 accept 同样要走 smc_common.accept_socket(Python
     # socket.accept 内部 getsockaddrlen 不认 AF_SMC)。
     conn, peer = accept_socket(srv, args.family)
+    # 防御性补设:buffer 必须在 listener 上就位(open_socket 建socket 时
+    # 已设,accept 子 socket 握手期继承——云侧接收窗口正确起步的关键,
+    # 勿把设 buffer 挪到 accept 之后:握手期按默认小 buffer 定型初始窗口,
+    # 持续排空的接收端在该内核上不再触发窗口增长,单流被钉死在初始窗口/
+    # RTT,vllm 真机实录 28KB@5ms ≈ 5MB/s)。TCP_NODELAY 在部分平台不随
+    # accept 继承,子 socket 重设一次;对已建立连接重设 buffer 幂等无害。
+    if args.family == "tcp":
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    _set_big_buffers(conn)
     print(f"[cloud] accepted from {peer}")
 
     stats = FrameStats()
