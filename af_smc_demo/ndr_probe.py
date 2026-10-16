@@ -204,12 +204,17 @@ def run_cloud(args) -> int:
             _send_line(ctrl, {"ok": True, "crc": crc32(buf[:nbytes])})
         elif cmd == "bw_recv":
             nbytes, iters = req["size"], req["iters"]
-            # 串行:挂 1 帧 WQE→等 CQE→再挂(B-E 同款模式,流水化在定制
-            # 栈上首测未过,先用已验证形态拿数字)
+            # 串行:挂 1 帧 WQE→等 CQE→再挂(B-E 同款模式)。
+            # WQE 恒挂整块长度:每轮末尾重挂的 WQE 会残留到下一轮,若按
+            # nbytes 挂、且下一轮帧更大(实测 1MiB→4MiB),首帧撞进过短
+            # 的残留 WQE → 响应端长度错 → QP 进 ERROR(status 9)。
+            # 整块挂则残留恒 128MiB,任何后续帧长都容得下(同生产
+            # verbs_wire._post_recv 的整块挂法,byte_len 报实际帧长)。
+            full = args.max_mb << 20
             t0 = time.monotonic()
             for k in range(iters):
                 buf, lkey, addr = blocks[k % n_blk]
-                holds.append(post_recv_addr(rc, addr, lkey, nbytes,
+                holds.append(post_recv_addr(rc, addr, lkey, full,
                                             1000 + k % n_blk))
                 wait_cqe(rc, True, 60.0)
             wall = time.monotonic() - t0
@@ -458,6 +463,7 @@ def run_edge(args) -> int:
             # 会互等死锁(首轮实测踩坑);回复在发送循环结束后收
             _send_line(ctrl, {"cmd": "bw_recv", "size": nbytes,
                               "iters": iters})
+            print(f"[F1] {mb}MiB {mode}: running...")
             t0 = time.monotonic()
             for i in range(iters):
                 # 串行 post→CQE→下一帧(B-E 已验证形态;流水化首测超时,
