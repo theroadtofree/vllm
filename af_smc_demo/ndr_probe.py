@@ -204,19 +204,14 @@ def run_cloud(args) -> int:
             _send_line(ctrl, {"ok": True, "crc": crc32(buf[:nbytes])})
         elif cmd == "bw_recv":
             nbytes, iters = req["size"], req["iters"]
+            # 串行:挂 1 帧 WQE→等 CQE→再挂(B-E 同款模式,流水化在定制
+            # 栈上首测未过,先用已验证形态拿数字)
             t0 = time.monotonic()
-            inflight = 0
-            done = 0
-            depth = min(4, iters)
-            while done < iters:
-                while inflight < depth and done + inflight < iters:
-                    buf, lkey, addr = blocks[(done + inflight) % n_blk]
-                    holds.append(
-                        post_recv_addr(rc, addr, lkey, nbytes, 1000))
-                    inflight += 1
-                wc = wait_cqe(rc, True, 60.0)
-                inflight -= 1
-                done += 1
+            for k in range(iters):
+                buf, lkey, addr = blocks[k % n_blk]
+                holds.append(post_recv_addr(rc, addr, lkey, nbytes,
+                                            1000 + k % n_blk))
+                wait_cqe(rc, True, 60.0)
             wall = time.monotonic() - t0
             _send_line(ctrl, {"wall_ms": wall * 1000,
                               "gbps": nbytes * iters * 8 / wall / 1e9})
@@ -463,39 +458,38 @@ def run_edge(args) -> int:
             # 会互等死锁(首轮实测踩坑);回复在发送循环结束后收
             _send_line(ctrl, {"cmd": "bw_recv", "size": nbytes,
                               "iters": iters})
-            keep = []
             t0 = time.monotonic()
             for i in range(iters):
+                # 串行 post→CQE→下一帧(B-E 已验证形态;流水化首测超时,
+                # 待单独定位后再提速)
                 if mode == "ndr_zero":
-                    keep.append(post_send_addr(
-                        rc, dev.data_ptr(), dev_lkey, nbytes, 2000))
+                    wr, sge = post_send_addr(
+                        rc, dev.data_ptr(), dev_lkey, nbytes, 2000)
                 elif mode == "ndr_d2d":
                     with torch.npu.stream(stream):
                         dev[:nbytes].copy_(src)
-                    keep.append(post_send_addr(
-                        rc, dev.data_ptr(), dev_lkey, nbytes, 2000))
-                else:  # 生产现状:D2H(pageable)→memmove 进注册块→post
+                    torch.npu.synchronize()  # D2D 落 HBM 再 post(计时含)
+                    wr, sge = post_send_addr(
+                        rc, dev.data_ptr(), dev_lkey, nbytes, 2000)
+                else:  # 生产现状:D2H(pageable)→拷入 host 注册块→post
                     t_d2h = time.monotonic()
                     host_t = src.cpu()  # non_blocking=False 同步 D2H
                     host_stage[:nbytes] = host_t.numpy().tobytes()
                     rows.setdefault("d2h_ms", 0)
                     rows["d2h_ms"] += (time.monotonic() - t_d2h) * 1000
-                    keep.append(post_send_addr(
+                    wr, sge = post_send_addr(
                         rc, ctypes.addressof(
                             (ctypes.c_char * max_bytes).from_buffer(
                                 host_stage)),
-                        stage_lkey, nbytes, 2000))
-                # 流水深度 4:每 4 帧收一次 CQE
-                if len(keep) > 4:
-                    wait_cqe(rc, False, 60.0)
-                    keep.pop(0)
-            while keep:
+                        stage_lkey, nbytes, 2000)
                 wait_cqe(rc, False, 60.0)
-                keep.pop(0)
+                del wr, sge
             wall = (time.monotonic() - t0) / iters
             rows[mode] = wall * 1000
             rep = _recv_line(ctrl)
             rows[mode + "_gbps"] = rep["gbps"]
+            print(f"[F1] {mb}MiB {mode}: {wall * 1000:.2f}ms/frame "
+                  f"cloud={rep['gbps']:.2f}Gbps")
         f_lines.append(
             f"{mb}MiB/frame: ndr_zero={rows['ndr_zero']:.2f}ms "
             f"ndr_d2d={rows['ndr_d2d']:.2f}ms staged={rows['staged']:.2f}ms "
