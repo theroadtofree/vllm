@@ -181,8 +181,12 @@ def run_cloud(args) -> int:
             _send_line(ctrl, {"ok": True})
             break
         elif cmd == "prepare_recv":
-            buf, lkey, addr = blocks[recv_slot % n_blk]
-            holds.append(post_recv_addr(rc, addr, lkey, req["size"], 1000))
+            slot = recv_slot % n_blk
+            buf, lkey, addr = blocks[slot]
+            # wr_id 必须编码块槽位:verify 按 wr_id-1000 取块,恒 1000
+            # 会让轮转块全被误读成 blocks[0] 的旧数据(首轮实测踩坑)
+            holds.append(
+                post_recv_addr(rc, addr, lkey, req["size"], 1000 + slot))
             recv_slot += 1
             _send_line(ctrl, {"ok": True})
         elif cmd == "verify":
@@ -253,7 +257,7 @@ def run_cloud(args) -> int:
                     bytes(memoryview(blocks[blk][0])[: wc.byte_len])))
                 buf, lkey, addr = blocks[blk]
                 holds.append(post_recv_addr(
-                    rc, addr, lkey, args.max_mb << 20, 1000))
+                    rc, addr, lkey, args.max_mb << 20, 1000 + blk))
             _send_line(ctrl, {"crcs": crcs})
         else:
             _send_line(ctrl, {"ok": False, "err": f"unknown cmd {cmd!r}"})
@@ -455,7 +459,10 @@ def run_edge(args) -> int:
             dev[:nbytes].copy_(src)
         rows = {}
         for mode in ("ndr_zero", "ndr_d2d", "staged"):
-            call({"cmd": "bw_recv", "size": nbytes, "iters": iters})
+            # 只发不等回复:cloud 的 bw_recv 要收完全部帧才回,同步 call
+            # 会互等死锁(首轮实测踩坑);回复在发送循环结束后收
+            _send_line(ctrl, {"cmd": "bw_recv", "size": nbytes,
+                              "iters": iters})
             keep = []
             t0 = time.monotonic()
             for i in range(iters):
