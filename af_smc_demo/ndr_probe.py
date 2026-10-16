@@ -246,6 +246,11 @@ def run_cloud(args) -> int:
             holds.append(
                 post_send_addr(rc, addr, lkey, wc.byte_len, 2000))
             wait_cqe(rc, False, 60.0)
+            # 回显后必须重挂接收 WQE:上一轮的已被本帧消耗,不补挂则
+            # 下一轮 edge 的帧到达时 RQ 空 → RNR 无限重试 → 双方超时
+            # (实测第 2 次迭代即卡死)
+            holds.append(post_recv_addr(
+                rc, addr, lkey, args.max_mb << 20, 1000 + blk))
             _send_line(ctrl, {"ok": True})
         elif cmd == "race_recv":
             crcs = []
