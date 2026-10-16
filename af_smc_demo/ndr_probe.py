@@ -173,8 +173,7 @@ def run_cloud(args) -> int:
         blocks.append((buf, lkey, ctypes.addressof(
             (ctypes.c_char * size).from_buffer(buf))))
     recv_slot = 0
-    holds: dict[int, bytes] = {}
-
+    holds: list = []  # WR/SGE 须存活到 CQE,统一挂起防悬挂(probe 短命)
     while True:
         req = _recv_line(ctrl)
         cmd = req.get("cmd")
@@ -183,7 +182,7 @@ def run_cloud(args) -> int:
             break
         elif cmd == "prepare_recv":
             buf, lkey, addr = blocks[recv_slot % n_blk]
-            post_recv_addr(rc, addr, lkey, req["size"], 1000)
+            holds.append(post_recv_addr(rc, addr, lkey, req["size"], 1000))
             recv_slot += 1
             _send_line(ctrl, {"ok": True})
         elif cmd == "verify":
@@ -196,7 +195,7 @@ def run_cloud(args) -> int:
             nbytes, seed = req["size"], req["seed"]
             buf, lkey, addr = blocks[0]
             buf[:nbytes] = make_bytes(nbytes, seed)
-            post_send_addr(rc, addr, lkey, nbytes, 2000)
+            holds.append(post_send_addr(rc, addr, lkey, nbytes, 2000))
             wait_cqe(rc, False, 60.0)
             _send_line(ctrl, {"ok": True, "crc": crc32(buf[:nbytes])})
         elif cmd == "bw_recv":
@@ -208,7 +207,8 @@ def run_cloud(args) -> int:
             while done < iters:
                 while inflight < depth and done + inflight < iters:
                     buf, lkey, addr = blocks[(done + inflight) % n_blk]
-                    post_recv_addr(rc, addr, lkey, nbytes, 1000)
+                    holds.append(
+                        post_recv_addr(rc, addr, lkey, nbytes, 1000))
                     inflight += 1
                 wc = wait_cqe(rc, True, 60.0)
                 inflight -= 1
@@ -239,9 +239,9 @@ def run_cloud(args) -> int:
             wc = wait_cqe(rc, True, 60.0)
             blk = wc.wr_id - 1000
             buf, lkey, addr = blocks[blk]
-            post_send_addr(rc, addr, lkey, wc.byte_len, 2000)
+            holds.append(
+                post_send_addr(rc, addr, lkey, wc.byte_len, 2000))
             wait_cqe(rc, False, 60.0)
-            holds[wc.wr_id] = None
             _send_line(ctrl, {"ok": True})
         elif cmd == "race_recv":
             crcs = []
@@ -252,7 +252,8 @@ def run_cloud(args) -> int:
                 crcs.append(crc32(
                     bytes(memoryview(blocks[blk][0])[: wc.byte_len])))
                 buf, lkey, addr = blocks[blk]
-                post_recv_addr(rc, addr, lkey, args.max_mb << 20, 1000)
+                holds.append(post_recv_addr(
+                    rc, addr, lkey, args.max_mb << 20, 1000))
             _send_line(ctrl, {"crcs": crcs})
         else:
             _send_line(ctrl, {"ok": False, "err": f"unknown cmd {cmd!r}"})
