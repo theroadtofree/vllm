@@ -351,8 +351,10 @@ def run_edge(args) -> int:
             seed = 1000 + i  # 内容每轮变化,同一 MR 不重注册
             _fill_dev(dev, nbytes, seed)
             call({"cmd": "prepare_recv", "size": nbytes})
-            post_send_addr(rc, dev.data_ptr(), dev_lkey, nbytes, 2000)
+            wr, sge = post_send_addr(rc, dev.data_ptr(), dev_lkey,
+                                     nbytes, 2000)
             wait_cqe(rc, False, 60.0)
+            del wr, sge  # CQE 已到,WR/SGE 方可释放
             rep = call({"cmd": "verify", "crc": crc32(make_bytes(nbytes,
                                                                  seed))})
             b_ok &= rep.get("match", False)
@@ -365,9 +367,14 @@ def run_edge(args) -> int:
         nbytes = mb << 20
         for i in range(8):
             seed = 2000 + i
-            ack = call({"cmd": "send_pattern", "size": nbytes, "seed": seed})
-            post_recv_addr(rc, dev.data_ptr(), dev_lkey, nbytes, 1000)
+            # 先挂 recv 再让对端发:RQ 空 → RNR 无限重试(rnr_retry=7)
+            # → 对端 send CQE 永不到来(首轮实测踩坑)
+            rwr, rsge = post_recv_addr(rc, dev.data_ptr(), dev_lkey,
+                                       nbytes, 1000)
+            ack = call({"cmd": "send_pattern", "size": nbytes,
+                        "seed": seed})
             wait_cqe(rc, True, 60.0)
+            del rwr, rsge
             got = crc32(_read_dev(dev, nbytes))
             c_ok &= (got == ack["crc"])
         c_detail.append(f"{mb}MiB x8")
@@ -378,13 +385,15 @@ def run_edge(args) -> int:
     nbytes = 29 << 20
     for i in range(16):
         seed = 3000 + i
-        src = torch.frombuffer(make_bytes(nbytes, seed),
+        src = torch.frombuffer(bytearray(make_bytes(nbytes, seed)),
                                dtype=torch.uint8).npu()
-        call({"cmd": "prepare_recv", "size": nbytes})
         with torch.npu.stream(torch.npu.Stream()):
             dev[:nbytes].copy_(src)  # D2D 落池(生产路径形态)
-        post_send_addr(rc, dev.data_ptr(), dev_lkey, nbytes, 2000)
+        torch.npu.synchronize()  # D2D 异步,post 前必须落 HBM
+        call({"cmd": "prepare_recv", "size": nbytes})
+        wr, sge = post_send_addr(rc, dev.data_ptr(), dev_lkey, nbytes, 2000)
         wait_cqe(rc, False, 60.0)
+        del wr, sge
         rep = call({"cmd": "verify", "crc": crc32(make_bytes(nbytes, seed))})
         d_ok &= rep.get("match", False)
     report("D", d_ok, "29MiB x16 (D2D refresh, single MR)")
@@ -408,8 +417,11 @@ def run_edge(args) -> int:
     for i in range(e_iters):
         with torch.npu.stream(stream):
             dev[:e_nbytes].copy_(srcs[i % 4])
-        post_send_addr(rc, dev.data_ptr(), dev_lkey, e_nbytes, 2000)
+        torch.npu.synchronize()  # 内容落 HBM 后再 post(竞态只测 CQE 后)
+        wr, sge = post_send_addr(rc, dev.data_ptr(), dev_lkey,
+                                 e_nbytes, 2000)
         wait_cqe(rc, False, 60.0)
+        del wr, sge
         if args.race_delay_ms > 0:
             time.sleep(args.race_delay_ms / 1000)
         # CQE 后立即覆写为下一帧内容(NDR 生产是否需要隔离期的直接量)
@@ -494,10 +506,12 @@ def run_edge(args) -> int:
         for _ in range(200):
             _send_line(ctrl, {"cmd": "echo", "size": nbytes})
             t0 = time.monotonic()
-            post_send_addr(rc, dev.data_ptr(), dev_lkey, nbytes, 2000)
-            post_recv_addr(rc, dev.data_ptr() + nbytes, dev_lkey,
-                           nbytes, 1000)
+            swr, ssge = post_send_addr(rc, dev.data_ptr(), dev_lkey,
+                                       nbytes, 2000)
+            rwr, rsge = post_recv_addr(rc, dev.data_ptr() + nbytes,
+                                       dev_lkey, nbytes, 1000)
             wait_cqe(rc, True, 10.0)
+            del swr, ssge, rwr, rsge
             lat.append((time.monotonic() - t0) * 1000)
             _recv_line(ctrl)  # 排空 echo 回复,防污染后续控制流
         lat.sort()
