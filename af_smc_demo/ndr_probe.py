@@ -267,9 +267,13 @@ def run_cloud(args) -> int:
 # --------------------------------------------------------------------- #
 
 def _fill_dev(dev, nbytes: int, seed: int) -> None:
-    """host 图案 H2D 进设备块头部(仅准备,不计入被测路径)。"""
+    """host 图案 H2D 进设备块头部(仅准备,不计入被测路径);copy_ 是
+    异步 enqueue,post_send 前必须同步,否则 NIC 可能读到未落 HBM 的
+    旧内容(与总线一致性问题区分开)。"""
     host = make_bytes(nbytes, seed)
-    dev[:nbytes].copy_(torch.frombuffer(host, dtype=torch.uint8))
+    dev[:nbytes].copy_(
+        torch.frombuffer(bytearray(host), dtype=torch.uint8))
+    torch.npu.synchronize()
 
 
 def _read_dev(dev, nbytes: int) -> bytes:
