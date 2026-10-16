@@ -408,46 +408,47 @@ def run_edge(args) -> int:
         d_ok &= rep.get("match", False)
     report("D", d_ok, "29MiB x16 (D2D refresh, single MR)")
 
-    # ---- Phase E:CQE/DMA 竞态量化 ----------------------------------- #
-    e_nbytes = 4 << 20
-    e_iters = 256
-    srcs = [torch.frombuffer(make_bytes(e_nbytes, 4000 + i),
-                             dtype=torch.uint8).npu() for i in range(4)]
-    call({"cmd": "prepare_recv", "size": e_nbytes})
-    # race_recv 模式:对端逐帧收并回传 crc 列表(预挂 1 深度)
-    _send_line(ctrl, {"cmd": "race_recv", "iters": e_iters})
-    # 本侧先预挂 K-1 帧?逐帧发:post→CQE→(延迟)覆写→post 下一帧
-    # 对端 race_recv 逐帧重挂,首帧用上面 prepare_recv 的 WQE
+    # ---- Phase E:CQE/DMA 竞态量化(4MiB + 生产帧长 29MiB 两档) -------- #
     stream = torch.npu.Stream()
-    expected = [crc32(make_bytes(e_nbytes, 4000 + (i + 1) % 4))
-                for i in range(e_iters)]
-    torn = stale = ok_cnt = 0
-    prev_crc_exp = [crc32(make_bytes(e_nbytes, 4000 + i % 4))
-                    for i in range(e_iters)]
-    for i in range(e_iters):
-        with torch.npu.stream(stream):
-            dev[:e_nbytes].copy_(srcs[i % 4])
-        torch.npu.synchronize()  # 内容落 HBM 后再 post(竞态只测 CQE 后)
-        wr, sge = post_send_addr(rc, dev.data_ptr(), dev_lkey,
-                                 e_nbytes, 2000)
-        wait_cqe(rc, False, 60.0)
-        del wr, sge
-        if args.race_delay_ms > 0:
-            time.sleep(args.race_delay_ms / 1000)
-        # CQE 后立即覆写为下一帧内容(NDR 生产是否需要隔离期的直接量)
-    rep = _recv_line(ctrl)
-    got = rep["crcs"]
-    for i, c in enumerate(got):
-        if c == prev_crc_exp[i]:
-            ok_cnt += 1
-        elif c == expected[i]:
-            stale += 1  # 对端收到的是"下一帧"内容(DMA 晚于覆写)
-        else:
-            torn += 1  # 撕裂帧(DMA 跨覆写窗口)
-    report("E", torn == 0 and stale == 0,
-           f"ok={ok_cnt} stale(next)={stale} torn={torn} "
-           f"delay={args.race_delay_ms}ms (torn/stale>0 ⇒ NDR 需要保留 "
-           f"CQE 后隔离期,逐步加 delay 重测找阈值)")
+    for e_mb in (4, 29):
+        e_nbytes = e_mb << 20
+        e_iters = 256
+        srcs = [torch.frombuffer(bytearray(make_bytes(e_nbytes, 4000 + i)),
+                                 dtype=torch.uint8).npu() for i in range(4)]
+        # 图案周期 4:期望 crc 只需 4 个值。帧 i 携带 i%4;CQE 后覆写为
+        # (i+1)%4——若 NIC 的 DMA 晚于覆写,对端会收到 (i+1)%4 的 crc
+        # (stale);跨覆写窗口则 crc 对不上任何图案(torn,撕裂帧)
+        crcs4 = [crc32(make_bytes(e_nbytes, 4000 + i)) for i in range(4)]
+        call({"cmd": "prepare_recv", "size": e_nbytes})
+        # race_recv:对端逐帧收、记 crc、即时重挂(预挂深度 1,首帧吃
+        # 上面 prepare_recv 的 WQE);回复在全部帧收完后到
+        _send_line(ctrl, {"cmd": "race_recv", "iters": e_iters})
+        for i in range(e_iters):
+            with torch.npu.stream(stream):
+                dev[:e_nbytes].copy_(srcs[i % 4])
+            torch.npu.synchronize()  # 内容落 HBM 后再 post(竞态只测 CQE 后)
+            wr, sge = post_send_addr(rc, dev.data_ptr(), dev_lkey,
+                                     e_nbytes, 2000)
+            wait_cqe(rc, False, 60.0)
+            del wr, sge
+            if args.race_delay_ms > 0:
+                time.sleep(args.race_delay_ms / 1000)
+            # CQE(+delay) 后立即进入下一轮覆写——NDR 是否需要发送
+            # 隔离期的直接量(29MiB 档的 DMA 窗口比 4MiB 长一个量级,
+            # 生产 UP 帧长的结论以此档为准)
+        torn = stale = ok_cnt = 0
+        rep = _recv_line(ctrl)
+        for i, c in enumerate(rep["crcs"]):
+            if c == crcs4[i % 4]:
+                ok_cnt += 1
+            elif c == crcs4[(i + 1) % 4]:
+                stale += 1  # 对端收到"下一帧"内容(DMA 晚于覆写)
+            else:
+                torn += 1  # 撕裂帧(DMA 跨覆写窗口)
+        report("E", torn == 0 and stale == 0,
+               f"{e_mb}MiB ok={ok_cnt} stale(next)={stale} torn={torn} "
+               f"delay={args.race_delay_ms}ms (torn/stale>0 ⇒ NDR 需保留 "
+               f"CQE 后隔离期,逐步加 delay 重测找阈值)")
 
     # ---- Phase F1:发送带宽 NDR vs 暂存 ------------------------------- #
     f_lines = []
