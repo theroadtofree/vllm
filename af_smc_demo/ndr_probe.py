@@ -58,6 +58,41 @@ def crc32(b: bytes) -> int:
     return zlib.crc32(b) & 0xFFFFFFFF
 
 
+# ACL 运行时(ctypes):方案 A 的块池直分配,绕开 torch 分配器——
+# 经典映射,与 PYTORCH_NPU_ALLOC_CONF=expandable_segments 无关
+def _load_acl():
+    for _n in ("libascendcl.so",
+               "/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so"):
+        try:
+            lib = ctypes.CDLL(_n)
+            lib.aclrtMalloc.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t,
+                ctypes.c_int]
+            lib.aclrtMalloc.restype = ctypes.c_int
+            lib.aclrtFree.argtypes = [ctypes.c_void_p]
+            lib.aclrtFree.restype = ctypes.c_int
+            lib.aclrtMemcpy.argtypes = [
+                ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                ctypes.c_size_t, ctypes.c_int]
+            lib.aclrtMemcpy.restype = ctypes.c_int
+            return lib
+        except OSError:
+            continue
+    return None
+
+
+_acl = _load_acl()
+_ACL_D2D = 3  # ACL_MEMCPY_DEVICE_TO_DEVICE
+
+
+def _aclrt_malloc(size: int) -> int:
+    ptr = ctypes.c_void_p(0)
+    rc = _acl.aclrtMalloc(ctypes.byref(ptr), size, 0)  # HUGE_FIRST
+    if rc != 0 or not ptr.value:
+        raise RuntimeError(f"aclrtMalloc({size}) failed rc={rc}")
+    return ptr.value
+
+
 def _vma_info(addr: int) -> str:
     """取 addr 所在 VMA 头行+VmFlags(留档:与引擎内注册失败时的
     vma=[...] 对比,定位 peermem 认领差异)。"""
@@ -379,6 +414,57 @@ def run_edge(args) -> int:
     dev_lkey, _ = reg_addr(rc, dev.data_ptr(), max_bytes,
                            vd._IBV_ACCESS_LOCAL_WRITE
                            | vd._IBV_ACCESS_REMOTE_WRITE)
+
+    # ---- Phase A2:方案A 可行性(aclrtMalloc 直分配 + 注册 + D2D 收发) --
+    # 复刻生产 NDR 块池形态:块不经 torch 分配器(expandable 与否无关),
+    # 写入走 aclrtMemcpy(D2D),接收直接 post_recv 进裸块 + D2H 回读
+    a2_ok, a2_detail = True, []
+    try:
+        raw = _aclrt_malloc(max_bytes)
+        rkey, rerr = reg_addr(rc, raw, max_bytes,
+                              vd._IBV_ACCESS_LOCAL_WRITE
+                              | vd._IBV_ACCESS_REMOTE_WRITE)
+        a2_ok &= (rerr == 0)
+        a2_detail.append(f"reg:{'ok' if not rerr else f'errno{rerr}'}")
+        # 发送链:torch 源 → aclrtMemcpy D2D 落裸块 → post_send
+        for i in range(8):
+            seed = 9000 + i
+            nbytes = 29 << 20
+            src = torch.frombuffer(bytearray(make_bytes(nbytes, seed)),
+                                   dtype=torch.uint8).npu()
+            crc_e = crc32(make_bytes(nbytes, seed))
+            rc_ = _acl.aclrtMemcpy(
+                ctypes.c_void_p(raw), nbytes,
+                ctypes.c_void_p(src.data_ptr()), nbytes, _ACL_D2D)
+            a2_ok &= (rc_ == 0)
+            call({"cmd": "prepare_recv", "size": nbytes})
+            wr, sge = post_send_addr(rc, raw, rkey, nbytes, 2000)
+            wait_cqe(rc, False, 60.0)
+            del wr, sge
+            rep = call({"cmd": "verify", "crc": crc_e})
+            a2_ok &= rep.get("match", False)
+        a2_detail.append("send29M x8")
+        # 接收链:post_recv 进裸块 → CQE → D2H 回读校验
+        hbuf = ctypes.create_string_buffer(max_bytes)
+        for i in range(4):
+            seed = 9500 + i
+            nbytes = 29 << 20
+            ack = call({"cmd": "send_pattern", "size": nbytes,
+                        "seed": seed})
+            rwr, rsge = post_recv_addr(rc, raw, rkey, nbytes, 1000)
+            wait_cqe(rc, True, 60.0)
+            del rwr, rsge
+            rc_ = _acl.aclrtMemcpy(
+                hbuf, nbytes, ctypes.c_void_p(raw), nbytes,
+                2)  # ACL_MEMCPY_DEVICE_TO_HOST
+            a2_ok &= (rc_ == 0 and crc32(hbuf.raw[:nbytes]) == ack["crc"])
+        a2_detail.append("recv29M x4")
+        _acl.aclrtFree(ctypes.c_void_p(raw))
+    except Exception as ex:  # noqa: BLE001
+        a2_ok = False
+        a2_detail.append(f"EXC:{ex!r}")
+    report("A2", a2_ok, " ".join(a2_detail) + " (aclrtMalloc 直分配,"
+           " 与 expandable_segments 配置无关;FAIL 则方案A 不成立)")
 
     # ---- Phase B:设备→线缆 完整性 ----------------------------------- #
     b_ok, b_detail = True, []
