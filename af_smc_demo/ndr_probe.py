@@ -58,6 +58,32 @@ def crc32(b: bytes) -> int:
     return zlib.crc32(b) & 0xFFFFFFFF
 
 
+def _vma_info(addr: int) -> str:
+    """取 addr 所在 VMA 头行+VmFlags(留档:与引擎内注册失败时的
+    vma=[...] 对比,定位 peermem 认领差异)。"""
+    try:
+        with open("/proc/self/smaps", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return "smaps-unreadable"
+    for i, ln in enumerate(lines):
+        head = ln.split(None, 5)
+        if len(head) < 5 or "-" not in head[0] or ":" in head[0]:
+            continue
+        try:
+            lo, hi = (int(x, 16) for x in head[0].split("-"))
+        except ValueError:
+            continue
+        if lo <= addr < hi:
+            flags = ""
+            for l2 in lines[i + 1:i + 40]:
+                if l2.startswith("VmFlags:"):
+                    flags = l2.strip()
+                    break
+            return f"{ln.rstrip()} ;; {flags}"
+    return "vma-not-found"
+
+
 # --------------------------------------------------------------------- #
 # verbs 原语:按裸地址 post(设备/_host MR 通用)                        #
 # --------------------------------------------------------------------- #
@@ -321,6 +347,7 @@ def run_edge(args) -> int:
     max_bytes = args.max_mb << 20
     dev = torch.empty(max_bytes, dtype=torch.uint8, device="npu")
     print(f"[edge] dev block {max_bytes >> 20}MiB @ {hex(dev.data_ptr())}")
+    print(f"[edge] dev vma: {_vma_info(dev.data_ptr())}")
 
     # ---- Phase A:注册能力 ------------------------------------------- #
     a_ok, a_detail = True, []
