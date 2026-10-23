@@ -25,6 +25,7 @@ embed 登记进度)-> prefill 编排(单请求组批 -> 范围预告 -> executor
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import threading
@@ -588,4 +589,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def shutdown(self) -> None:
         """两面关停后走原生;初始化失败路径两面可能未建,容忍缺省。"""
         self._lwd_shutdown_planes()
+        # 数据面 wire 同进程收尾(确定性顺序;atexit 另有兜底)
+        with contextlib.suppress(Exception):
+            from vllm_ascend.distributed.lwd_wire import (
+                shutdown_lwd_duplex_channels,
+            )
+            shutdown_lwd_duplex_channels()
         super().shutdown()

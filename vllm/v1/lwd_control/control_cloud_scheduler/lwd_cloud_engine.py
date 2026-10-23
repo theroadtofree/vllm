@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -223,6 +224,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         publisher = getattr(self, "_lwd_post_out", None)
         if publisher is not None:
             publisher.shutdown()
+        # 数据面 wire 同进程收尾(确定性顺序;atexit 另有兜底)
+        with contextlib.suppress(Exception):
+            from vllm_ascend.distributed.lwd_wire import (
+                shutdown_lwd_duplex_channels,
+            )
+            shutdown_lwd_duplex_channels()
         super().shutdown()
 
     def _lwd_dispatch(self, msg) -> None:
