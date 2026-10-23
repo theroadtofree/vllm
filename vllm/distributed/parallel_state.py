@@ -1584,14 +1584,27 @@ def _rewrite_rendezvous_to_local(method: str, enabled: bool = True) -> str:
     env:// 形态由外部启动器管理,不改;已指向本机的 init_method
     (常规单机部署)保持原样,零行为变化。"""
     if not method.startswith("tcp://"):
+        logger.info("[lwd][rdzv] no-rewrite: not tcp:// (%s)", method)
         return method
     force = os.getenv("VLLM_RDZV_FORCE_LOCAL")
     if force is not None:
         enabled = force == "1"
+        logger.info(
+            "[lwd][rdzv] force env VLLM_RDZV_FORCE_LOCAL=%s -> enabled=%s",
+            force, enabled)
     if not enabled:
+        logger.info(
+            "[lwd][rdzv] no-rewrite: GATE OFF (多节点/DP 形态,nnodes>1 "
+            "或 data_parallel_size>1 时 rendezvous 必须跨机;如确认实例 "
+            "world 闭包本机,设 VLLM_RDZV_FORCE_LOCAL=1 强制) method=%s",
+            method)
         return method
     host, _, port_s = method[len("tcp://"):].rpartition(":")
     if not host or _is_local_address(host):
+        logger.info(
+            "[lwd][rdzv] no-rewrite: host %r 判定为本机地址(host_ip_env="
+            "%r get_ip=%s) method=%s",
+            host, os.getenv("VLLM_HOST_IP"), get_ip(), method)
         return method
     try:
         port = int(port_s)
@@ -1670,6 +1683,19 @@ def init_distributed_environment(
             config is None
             or (config.parallel_config.nnodes <= 1
                 and config.parallel_config.data_parallel_size <= 1)
+        )
+        # 诊断快照:一次跑齐改写决策的全部输入(代码副本/门控因子/
+        # 环境变量/探测 IP),grep "[lwd][rdzv]" 即得结论
+        _rdzv_pcfg = getattr(config, "parallel_config", None)
+        logger.info(
+            "[lwd][rdzv] pre-rewrite: method=%s ws=%d rank=%d "
+            "single_node=%s nnodes=%s dp_size=%s force=%r "
+            "VLLM_HOST_IP=%r get_ip=%s src=%s",
+            distributed_init_method, world_size, rank, _single_node,
+            getattr(_rdzv_pcfg, "nnodes", "?"),
+            getattr(_rdzv_pcfg, "data_parallel_size", "?"),
+            os.getenv("VLLM_RDZV_FORCE_LOCAL"),
+            os.getenv("VLLM_HOST_IP"), get_ip(), __file__,
         )
         distributed_init_method = _rewrite_rendezvous_to_local(
             distributed_init_method, enabled=_single_node)
