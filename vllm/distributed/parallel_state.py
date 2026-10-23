@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -52,7 +53,7 @@ from vllm.distributed.utils import (
 )
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.network_utils import get_distributed_init_method
+from vllm.utils.network_utils import get_distributed_init_method, get_ip
 from vllm.utils.system_utils import suppress_stdout
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
@@ -1547,6 +1548,66 @@ def _init_elastic_ep_world(
     _WORLD = world
 
 
+def _is_local_address(host: str) -> bool:
+    """host 是否本机地址(本机路由 IP / 回环 / 主机名解析出的任一 IP)。"""
+    import socket as _socket
+
+    if host in ("127.0.0.1", "localhost", get_ip()):
+        return True
+    try:
+        _, _, addrs = _socket.gethostbyname_ex(_socket.gethostname())
+    except OSError:
+        addrs = []
+    return host in addrs
+
+
+def _rewrite_rendezvous_to_local(method: str, enabled: bool = True) -> str:
+    """LWD 拆 world:把 rendezvous 闭包到本机,不再依赖 --master-addr。
+
+    master_addr 在边云部署里承载控制面 ZMQ 寻址语义(云 connect 边的
+    POST_OUT),不能改指本机;而 torch.distributed 的 store rendezvous
+    是一次性全员参与语义——两端共用边机 store 时,单侧重启后对侧永不
+    重新参与,重启侧必卡死在 init_process_group 的 store barrier
+    (真机实录:云重启卡在 init_distributed_environment 的 world_size
+    日志之后)。
+
+    本函数在 init 前把指向非本机地址的 tcp:// init_method 改写为本机
+    IP + 派生端口:实例 world 各自闭包机内,单侧重启即可自行重新
+    rendezvous。
+
+    门控(enabled 由调用方传入,单机实例才启用——nnodes>1/dp>1 的
+    真多节点 rendezvous 必须跨机,不改写):
+      * VLLM_RDZV_FORCE_LOCAL=1 强制启用 / =0 强制关闭(逃生口)。
+
+    端口取 VLLM_LOCAL_RDZV_PORT(env 显式指定),否则原端口+1000
+    (边云异机部署天然不冲突;同机双实例部署必须用 env 分开端口)。
+    env:// 形态由外部启动器管理,不改;已指向本机的 init_method
+    (常规单机部署)保持原样,零行为变化。"""
+    if not method.startswith("tcp://"):
+        return method
+    force = os.getenv("VLLM_RDZV_FORCE_LOCAL")
+    if force is not None:
+        enabled = force == "1"
+    if not enabled:
+        return method
+    host, _, port_s = method[len("tcp://"):].rpartition(":")
+    if not host or _is_local_address(host):
+        return method
+    try:
+        port = int(port_s)
+    except ValueError:
+        return method
+    env_port = os.getenv("VLLM_LOCAL_RDZV_PORT")
+    rdzv_port = int(env_port) if env_port else port + 1000
+    new_method = f"tcp://{get_ip()}:{rdzv_port}"
+    logger.warning(
+        "[lwd] rendezvous rewritten to local: %s -> %s "
+        "(master_addr 保留控制面寻址语义;实例 world 闭包机内,单侧重启"
+        "可自行重新建组)", method, new_method,
+    )
+    return new_method
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1611,6 +1672,16 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
+        # LWD 拆 world:rendezvous 闭包本机(见 _rewrite_rendezvous_to_local)。
+        # 门控:单机实例(nnodes<=1 且 dp<=1)才启用——真多节点部署的
+        # rendezvous 必须跨机,不能改写;VLLM_RDZV_FORCE_LOCAL 可强制。
+        _single_node = (
+            config is None
+            or (config.parallel_config.nnodes <= 1
+                and config.parallel_config.data_parallel_size <= 1)
+        )
+        distributed_init_method = _rewrite_rendezvous_to_local(
+            distributed_init_method, enabled=_single_node)
         if not torch.distributed.is_backend_available(backend):
             logger.warning(
                 "Distributed backend %s is not available; falling back to gloo.",
