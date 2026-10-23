@@ -1660,6 +1660,19 @@ def init_distributed_environment(
                 distributed_init_method,
             )
     if not torch.distributed.is_initialized():
+        # LWD 拆 world:rendezvous 闭包本机(见 _rewrite_rendezvous_to_local)。
+        # 门控:单机实例(nnodes<=1 且 dp<=1)才启用——真多节点部署的
+        # rendezvous 必须跨机,不能改写;VLLM_RDZV_FORCE_LOCAL 可强制。
+        # 置于 world_size 日志之前:日志打的是实际使用的 init_method
+        # (否则日志仍显示改写前的对端地址,误导排查)。
+        # IP 取 get_ip():优先 VLLM_HOST_IP,未设才走默认路由探测。
+        _single_node = (
+            config is None
+            or (config.parallel_config.nnodes <= 1
+                and config.parallel_config.data_parallel_size <= 1)
+        )
+        distributed_init_method = _rewrite_rendezvous_to_local(
+            distributed_init_method, enabled=_single_node)
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
             world_size,
@@ -1672,16 +1685,6 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
-        # LWD 拆 world:rendezvous 闭包本机(见 _rewrite_rendezvous_to_local)。
-        # 门控:单机实例(nnodes<=1 且 dp<=1)才启用——真多节点部署的
-        # rendezvous 必须跨机,不能改写;VLLM_RDZV_FORCE_LOCAL 可强制。
-        _single_node = (
-            config is None
-            or (config.parallel_config.nnodes <= 1
-                and config.parallel_config.data_parallel_size <= 1)
-        )
-        distributed_init_method = _rewrite_rendezvous_to_local(
-            distributed_init_method, enabled=_single_node)
         if not torch.distributed.is_backend_available(backend):
             logger.warning(
                 "Distributed backend %s is not available; falling back to gloo.",
