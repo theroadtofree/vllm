@@ -56,8 +56,20 @@ def _lwd_diag_token_passthrough_enabled() -> bool:
             or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
             or os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_DOWN_RECV") == "1")
 
-# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
+# PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 已周期化,见下)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
+
+# HELLO 周期间隔(心跳即发现):边(重)启动后等一拍即重新发现 PRE_OUT
+# 端点;队满/空闲均不停发(空闲超时自补,满载超龄补发)。env 可调。
+def _hello_interval_s() -> float:
+    try:
+        return max(0.2, float(os.environ.get(
+            "VLLM_ASCEND_LWD_HELLO_INTERVAL_S", "1.0")))
+    except ValueError:
+        return 1.0
+
+# 云进程拉起随机 id:随周期 HELLO 捎带,值变化即"云重启过"(边侧留痕)
+_CLOUD_BOOT_ID = int.from_bytes(os.urandom(8), "little")
 
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
@@ -90,17 +102,11 @@ class LwdCloudEngineCore(EngineCoreProc):
 
 
     def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
+        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载周期
         HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
         self._lwd_subscriber = LwdControlSubscriber(
             config.lwd_pre_out_endpoint(), bind=True
-        )
-        master_addr = self.vllm_config.parallel_config.master_addr
-        self._lwd_post_out = LwdControlPublisher(
-            f"tcp://{master_addr}:{config.post_out_port}",
-            bind=False,
-            encoder=lwd_encode_cloud_notify,
         )
         sched_config = self.vllm_config.scheduler_config
         spec_config = getattr(self.vllm_config, "speculative_config", None)
@@ -117,8 +123,20 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 边侧与本地配置比对(不一致仅告警,建连以本地为准)
             data_plane_host=config.lwd_data_plane_host(),
             data_plane_port_base=config.data_plane_port_base,
+            # 云重启指纹:值变化即云进程重启过(边侧日志留痕)
+            cloud_boot_id=_CLOUD_BOOT_ID,
         )
-        # 首拍即通告(边侧可能已 bind 等待)
+        master_addr = self.vllm_config.parallel_config.master_addr
+        self._lwd_post_out = LwdControlPublisher(
+            f"tcp://{master_addr}:{config.post_out_port}",
+            bind=False,
+            encoder=lwd_encode_cloud_notify,
+            # 周期 HELLO:心跳即发现——边(重)启动后等一拍即连上,
+            # 不再依赖"云先起且只发一次"的拉起顺序
+            periodic_msg=self._lwd_hello,
+            periodic_interval_s=_hello_interval_s(),
+        )
+        # 首拍即通告(边侧可能已 bind 等待),此后周期续发
         self._lwd_announce()
         # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
@@ -188,11 +206,13 @@ class LwdCloudEngineCore(EngineCoreProc):
             self._lwd_dispatch(msg)
 
     def _lwd_announce(self) -> None:
-        """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
+        """首拍 HELLO 通告(此后周期续发);队满不重试,由周期拍与边侧
+        等待超时 fail-fast 兜底。"""
         self._lwd_post_out.publish(self._lwd_hello)
         logger.info(
-            "[Lwd][cloud] HELLO announced: pre_out=%s:%s",
+            "[Lwd][cloud] HELLO announced: pre_out=%s:%s boot_id=%s",
             self._lwd_hello.pre_out_host, self._lwd_hello.pre_out_port,
+            f"{_CLOUD_BOOT_ID:016x}",
         )
 
     def shutdown(self) -> None:

@@ -79,8 +79,12 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
 
 
 class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
-    """云->边发现通告(POST_OUT,首拍一次);pre_out_* 是边侧连接云端点的
-    唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
+    """云->边发现通告(POST_OUT,周期发送:心跳即发现);pre_out_* 是边侧
+    连接云端点的唯一事实源,pre_out_host 须为边可路由真实 IP
+    (0.0.0.0 不可作通告值)。
+
+    周期语义:边(重)启动后等下一拍即重新发现;边侧超过阈值未收到即判
+    云失联(见 edge engine HELLO 静默计时)。
 
     调度三元组(max_num_batched_tokens/max_num_seqs/num_speculative_
     tokens)供边侧互校:三者是 cap/preflight 公式两侧的同源输入,
@@ -100,6 +104,10 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     未携带(msgspec 带默认字段,线上 additive 兼容)。"""
     data_plane_port_base: int = 0
     """数据面端口基址:UP=base, DOWN=base+1;0 = 未携带。"""
+    cloud_boot_id: int = 0
+    """云端点每次进程拉起的随机 id(周期通告捎带):值变化即"云服务重启
+    过",边侧日志留痕(与数据面 ucx_wire 的 peer_session 同思路)。
+    缺省 0 = 旧版云侧未携带(msgspec 带默认字段,additive 兼容)。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值

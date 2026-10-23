@@ -143,9 +143,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _receive_thread(self, hello_event: threading.Event) -> None:
         """POST_OUT 接收线程体,按消息类型分发。
 
-        HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
-        retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
-        (构造期发布队列必空,该路径仅防御性保活)。
+        HELLO -> retarget PRE_OUT:云端点唯一事实源,周期通告(心跳即
+        发现,间隔默认 1s);retarget 队满时自旋重试到成功(周期拍会
+        持续到货,该路径仅防御性保活);静默超阈值判云失联(告警一次,
+        恢复时留痕),boot_id 变化即"云重启过"。
         LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
         + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
         引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
@@ -155,16 +156,49 @@ class LwdEdgeEngineCore(EngineCoreProc):
         """
         receiver = self._edge_receiver
         publisher = self._edge_sender
+        # 云侧 HELLO 周期默认 1s,静默阈值取 10s(约 10 拍,env 可调)
+        try:
+            hello_silent_s = max(
+                3.0, float(os.environ.get(
+                    "VLLM_ASCEND_LWD_HELLO_SILENT_S", "10.0")))
+        except ValueError:
+            hello_silent_s = 10.0
+        last_hello = 0.0
+        cloud_silent = False
+        boot_id = 0
         while not receiver.closed:
             msg = receiver.recv(timeout_ms=5000)
             if msg is None:
+                now = time.monotonic()
+                if (hello_event.is_set() and not cloud_silent
+                        and last_hello
+                        and now - last_hello > hello_silent_s):
+                    cloud_silent = True
+                    logger.warning(
+                        "[Lwd] cloud silent %.0fs (no HELLO): 控制面上行"
+                        "挂起,等待云恢复(周期 HELLO 自动重连)",
+                        now - last_hello)
                 continue
             if isinstance(msg, LwdHelloNotify):
                 endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
+                now = time.monotonic()
                 if not hello_event.is_set():
                     logger.info(
-                        "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s", endpoint
-                    )
+                        "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s",
+                        endpoint)
+                elif cloud_silent:
+                    cloud_silent = False
+                    logger.warning(
+                        "[Lwd] cloud back after %.0fs silent",
+                        now - last_hello)
+                if msg.cloud_boot_id and msg.cloud_boot_id != boot_id:
+                    if boot_id:
+                        logger.warning(
+                            "[Lwd] cloud RESTARTED (boot_id %s -> %s)",
+                            f"{boot_id:016x}",
+                            f"{msg.cloud_boot_id:016x}")
+                    boot_id = msg.cloud_boot_id
+                last_hello = now
                 # 载荷留存供构造线程互校(调度三元组,见 _lwd_cross_check_hello)
                 self._lwd_peer_hello = msg
                 # 数据面(AF_SMC)端点互校:建连以本地配置为准(与云 worker

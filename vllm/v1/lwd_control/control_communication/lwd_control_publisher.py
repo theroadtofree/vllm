@@ -34,6 +34,12 @@ class _LwdRetarget:
         self.endpoint = endpoint
 
 
+class _LwdPeriodic:
+    """周期拍哨兵(队列空闲超时的本地替身):发送 periodic_msg。"""
+
+    __slots__ = ()
+
+
 LWD_PUBLISH_QUEUE_MAX = 1000
 
 
@@ -48,10 +54,18 @@ class LwdControlPublisher:
         bind: bool,
         queue_max: int = LWD_PUBLISH_QUEUE_MAX,
         encoder: Callable[[Any], bytes] = lwd_encode_notify,
+        periodic_msg: Any | None = None,
+        periodic_interval_s: float = 0.0,
     ) -> None:
+        """periodic_msg/periodic_interval_s: 周期自动消息(心跳即发现)。
+        发送线程在队列空闲超时或持续满载超龄时自补一条——新拉起的对端
+        只认发现通告(如 HELLO),真实流量不能替代它。间隔<=0 关闭。"""
         self._closed = False
         self._encoder = encoder
         self._queue: queue.Queue = queue.Queue(maxsize=queue_max)
+        self._periodic_msg = periodic_msg if periodic_interval_s > 0 else None
+        self._periodic_interval_s = periodic_interval_s
+        self._last_periodic = 0.0
         self._communicator = LwdControlCommunicator(endpoint, zmq.PUSH, bind=bind)
         self._thread = threading.Thread(
             target=self._send_thread, name="lwd-publisher", daemon=True
@@ -98,13 +112,34 @@ class LwdControlPublisher:
             self._thread.join(timeout=1.0)
 
     def _send_thread(self) -> None:
+        import time as _time
+        self._last_periodic = _time.monotonic()
         while True:
-            msg = self._queue.get()
+            if self._periodic_msg is not None:
+                # 周期模式:队列空闲一个间隔即自补心跳/发现通告
+                try:
+                    msg = self._queue.get(timeout=self._periodic_interval_s)
+                except queue.Empty:
+                    msg = _LwdPeriodic()
+            else:
+                msg = self._queue.get()
             if msg is _LWD_PUBLISH_SHUTDOWN:
                 break
             if isinstance(msg, _LwdRetarget):
                 self._communicator.retarget(msg.endpoint)
                 continue
+            if isinstance(msg, _LwdPeriodic):
+                self._communicator.send(self._encoder(self._periodic_msg))
+                self._last_periodic = _time.monotonic()
+                continue
             # 无对端时 send 阻塞,背压由有界队列传导给 publish 返回值
             self._communicator.send(self._encoder(msg))
+            # 持续满载防护:timeout 拍永不触发时发现通告会饿死(新拉起
+            # 的对端只认 HELLO),超龄即补——真实流量不能替代发现语义
+            if self._periodic_msg is not None:
+                now = _time.monotonic()
+                if now - self._last_periodic >= self._periodic_interval_s:
+                    self._communicator.send(
+                        self._encoder(self._periodic_msg))
+                    self._last_periodic = now
         self._communicator.close()
