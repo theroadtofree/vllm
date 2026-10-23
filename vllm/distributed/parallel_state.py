@@ -1575,14 +1575,16 @@ def _rewrite_rendezvous_to_local(method: str, enabled: bool = True) -> str:
     IP + 派生端口:实例 world 各自闭包机内,单侧重启即可自行重新
     rendezvous。
 
-    门控(enabled 由调用方传入,单机实例才启用——nnodes>1/dp>1 的
-    真多节点 rendezvous 必须跨机,不改写):
-      * VLLM_RDZV_FORCE_LOCAL=1 强制启用 / =0 强制关闭(逃生口)。
+    默认改写(LWD 边云形态:nnodes=2 联合建模,但实例 rank 全在
+    本机——诊断实录 nnodes=2/dp=1/ws=8 全本机);已指向本机的
+    init_method(常规单机/master 即本机)保持原样。
+      * VLLM_RDZV_FORCE_LOCAL=1 强制启用 / =0 关闭(逃生口:标准
+        多节点部署中非 rank0 节点的 rank 需要跨机 rendezvous,必须
+        设 0 关闭本改写)。
 
     端口取 VLLM_LOCAL_RDZV_PORT(env 显式指定),否则原端口+1000
     (边云异机部署天然不冲突;同机双实例部署必须用 env 分开端口)。
-    env:// 形态由外部启动器管理,不改;已指向本机的 init_method
-    (常规单机部署)保持原样,零行为变化。"""
+    env:// 形态由外部启动器管理,不改。"""
     if not method.startswith("tcp://"):
         logger.info("[lwd][rdzv] no-rewrite: not tcp:// (%s)", method)
         return method
@@ -1594,9 +1596,8 @@ def _rewrite_rendezvous_to_local(method: str, enabled: bool = True) -> str:
             force, enabled)
     if not enabled:
         logger.info(
-            "[lwd][rdzv] no-rewrite: GATE OFF (多节点/DP 形态,nnodes>1 "
-            "或 data_parallel_size>1 时 rendezvous 必须跨机;如确认实例 "
-            "world 闭包本机,设 VLLM_RDZV_FORCE_LOCAL=1 强制) method=%s",
+            "[lwd][rdzv] no-rewrite: DISABLED by VLLM_RDZV_FORCE_LOCAL=0"
+            "(标准多节点部署需跨机 rendezvous) method=%s",
             method)
         return method
     host, _, port_s = method[len("tcp://"):].rpartition(":")
@@ -1674,31 +1675,24 @@ def init_distributed_environment(
             )
     if not torch.distributed.is_initialized():
         # LWD 拆 world:rendezvous 闭包本机(见 _rewrite_rendezvous_to_local)。
-        # 门控:单机实例(nnodes<=1 且 dp<=1)才启用——真多节点部署的
-        # rendezvous 必须跨机,不能改写;VLLM_RDZV_FORCE_LOCAL 可强制。
-        # 置于 world_size 日志之前:日志打的是实际使用的 init_method
-        # (否则日志仍显示改写前的对端地址,误导排查)。
+        # 默认改写非本机 host——边云联合建模 nnodes=2 但实例 rank 全在
+        # 本机(诊断实录:nnodes=2/dp=1/ws=8 全本机);标准多节点部署
+        # (非 rank0 节点需跨机)设 VLLM_RDZV_FORCE_LOCAL=0 关闭。
+        # 置于 world_size 日志之前:日志打的是实际使用的 init_method。
         # IP 取 get_ip():优先 VLLM_HOST_IP,未设才走默认路由探测。
-        _single_node = (
-            config is None
-            or (config.parallel_config.nnodes <= 1
-                and config.parallel_config.data_parallel_size <= 1)
-        )
-        # 诊断快照:一次跑齐改写决策的全部输入(代码副本/门控因子/
-        # 环境变量/探测 IP),grep "[lwd][rdzv]" 即得结论
         _rdzv_pcfg = getattr(config, "parallel_config", None)
         logger.info(
             "[lwd][rdzv] pre-rewrite: method=%s ws=%d rank=%d "
-            "single_node=%s nnodes=%s dp_size=%s force=%r "
+            "nnodes=%s dp_size=%s force=%r "
             "VLLM_HOST_IP=%r get_ip=%s src=%s",
-            distributed_init_method, world_size, rank, _single_node,
+            distributed_init_method, world_size, rank,
             getattr(_rdzv_pcfg, "nnodes", "?"),
             getattr(_rdzv_pcfg, "data_parallel_size", "?"),
             os.getenv("VLLM_RDZV_FORCE_LOCAL"),
             os.getenv("VLLM_HOST_IP"), get_ip(), __file__,
         )
         distributed_init_method = _rewrite_rendezvous_to_local(
-            distributed_init_method, enabled=_single_node)
+            distributed_init_method)
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
             world_size,
